@@ -73,6 +73,7 @@ pio run -t uploadfs
 - `GET/POST /api/firmware/config` — OTA repo и имена ассетов
 - `POST /api/firmware/check/latest` — проверка доступности latest URL (firmware/fs)
 - `POST /api/firmware/update/latest` — обновление до последнего релиза
+- `POST /api/firmware/update/release` — обновление до выбранного release tag
 - `POST /api/firmware/update/url` — обновление по прямым URL
 
 ## OTA (как в peristaltic)
@@ -80,7 +81,7 @@ pio run -t uploadfs
 Вкладка `Настройки -> OTA Обновление`:
 1. Укажите `GitHub Repo` и имена ассетов (`firmware.bin`, `littlefs.bin`).
 2. Если поле `GitHub Repo` оставить пустым, автоматически подставится `dslimp/shutter`.
-3. Используйте `Обновить до последнего` (формат URL: `.../releases/latest/download/...`).
+3. Используйте `Загрузить релизы` (UI запрашивает теги напрямую из GitHub API) и `Обновить выбранный` для конкретной версии, либо `Обновить до последнего`.
 
 Для локального OTA (без GitHub) используйте `Обновить по URL`, указав прямые ссылки на:
 - `firmware.bin`
