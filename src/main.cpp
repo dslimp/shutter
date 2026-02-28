@@ -14,7 +14,7 @@
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.5-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.6-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
@@ -71,6 +71,10 @@ bool resetTopReferenceWhenStopped = false;
 String firmwareRepo = cfg::kDefaultFirmwareRepo;
 String firmwareAssetName = cfg::kDefaultFirmwareAssetName;
 String firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
+
+#if defined(OTA_FW_PAD_BYTES) && (OTA_FW_PAD_BYTES > 0)
+__attribute__((used)) const uint8_t kOtaFirmwarePad[OTA_FW_PAD_BYTES] PROGMEM = {0xA5};
+#endif
 
 bool isValidGithubRepo(const String& value) {
   const int slash = value.indexOf('/');

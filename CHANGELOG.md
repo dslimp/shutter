@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.6] - 2026-02-28
+
+- OTA stress-test build: increased firmware size (`OTA_FW_PAD_BYTES=65536`) and filesystem image (extra `data/ota_pad.bin`).
+
 ## [0.1.5] - 2026-02-28
 
 - OTA pipeline switched from manual `Update.writeStream` to `ESP8266httpUpdate` for better stability.
