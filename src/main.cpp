@@ -13,7 +13,7 @@
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.2-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.3-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
@@ -443,6 +443,7 @@ bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessa
 
   HTTPClient http;
   http.setTimeout(60000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   WiFiClient plainClient;
   std::unique_ptr<BearSSL::WiFiClientSecure> secureClient(new BearSSL::WiFiClientSecure());
   if (isHttps) secureClient->setInsecure();
