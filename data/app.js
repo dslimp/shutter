@@ -89,6 +89,7 @@ function renderState(state) {
   setInputValue('acceleration', Number(state.acceleration || 0).toFixed(0));
   setInputValue('coilHoldMs', state.coilHoldMs);
   setCheckboxValue('reverseDirection', state.reverseDirection);
+  setCheckboxValue('wifiModemSleep', state.wifiModemSleep);
   setTextValue('fwRepo', state.firmwareRepo || '');
   setTextValue('fwAssetName', state.firmwareAssetName || 'firmware.bin');
   setTextValue('fwFsAssetName', state.firmwareFsAssetName || 'littlefs.bin');
@@ -204,6 +205,7 @@ async function resetCalibration() {
 async function saveSettings() {
   const payload = {
     reverseDirection: document.getElementById('reverseDirection').checked,
+    wifiModemSleep: document.getElementById('wifiModemSleep').checked,
     travelSteps: Number(document.getElementById('travelSteps').value),
     maxSpeed: Number(document.getElementById('maxSpeed').value),
     acceleration: Number(document.getElementById('acceleration').value),
@@ -287,7 +289,7 @@ async function updateFirmwareFromUrl() {
 
 showTab('control');
 
-['travelSteps', 'maxSpeed', 'acceleration', 'coilHoldMs', 'reverseDirection'].forEach((id) => {
+['travelSteps', 'maxSpeed', 'acceleration', 'coilHoldMs', 'reverseDirection', 'wifiModemSleep'].forEach((id) => {
   const el = document.getElementById(id);
   if (!el) return;
   el.addEventListener('input', () => { settingsDirty = true; });

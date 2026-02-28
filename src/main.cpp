@@ -42,6 +42,7 @@ struct ControllerState {
   long currentPosition = 0;
   bool calibrated = false;
   bool reverseDirection = false;
+  bool wifiModemSleep = false;
   float maxSpeed = 700.0f;
   float acceleration = 350.0f;
   uint16_t coilHoldMs = 500;
@@ -83,6 +84,10 @@ long currentLogicalPosition() {
 void applyStepperSettings() {
   stepper.setMaxSpeed(state.maxSpeed);
   stepper.setAcceleration(state.acceleration);
+}
+
+void applyWiFiPowerMode() {
+  WiFi.setSleepMode(state.wifiModemSleep ? WIFI_MODEM_SLEEP : WIFI_NONE_SLEEP);
 }
 
 void markDirty() { settingsDirty = true; }
@@ -135,6 +140,7 @@ void fillStateJson(JsonObject root) {
   root["positionPercent"] = posPercent;
   root["targetPercent"] = tgtPercent;
   root["reverseDirection"] = state.reverseDirection;
+  root["wifiModemSleep"] = state.wifiModemSleep;
   root["maxSpeed"] = state.maxSpeed;
   root["acceleration"] = state.acceleration;
   root["coilHoldMs"] = state.coilHoldMs;
@@ -159,6 +165,7 @@ bool loadState() {
   state.currentPosition = shutter::math::clampLong(doc["currentPosition"] | state.currentPosition, 0, state.travelSteps);
   state.calibrated = doc["calibrated"] | state.calibrated;
   state.reverseDirection = doc["reverseDirection"] | state.reverseDirection;
+  state.wifiModemSleep = doc["wifiModemSleep"] | state.wifiModemSleep;
   state.maxSpeed = shutter::math::clampFloat(doc["maxSpeed"] | state.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
   state.acceleration = shutter::math::clampFloat(doc["acceleration"] | state.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
   state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(doc["coilHoldMs"] | state.coilHoldMs, 0, cfg::kMaxCoilHoldMs));
@@ -182,6 +189,7 @@ bool saveState(bool force = false) {
   doc["currentPosition"] = pos;
   doc["calibrated"] = state.calibrated;
   doc["reverseDirection"] = state.reverseDirection;
+  doc["wifiModemSleep"] = state.wifiModemSleep;
   doc["maxSpeed"] = state.maxSpeed;
   doc["acceleration"] = state.acceleration;
   doc["coilHoldMs"] = state.coilHoldMs;
@@ -339,6 +347,9 @@ void handleApiSettings() {
   if (body.containsKey("reverseDirection")) {
     state.reverseDirection = body["reverseDirection"].as<bool>();
   }
+  if (body.containsKey("wifiModemSleep")) {
+    state.wifiModemSleep = body["wifiModemSleep"].as<bool>();
+  }
   if (body.containsKey("maxSpeed")) {
     state.maxSpeed = shutter::math::clampFloat(body["maxSpeed"].as<float>(), cfg::kMinSpeed, cfg::kMaxSpeed);
   }
@@ -353,6 +364,7 @@ void handleApiSettings() {
   }
 
   applyStepperSettings();
+  applyWiFiPowerMode();
 
   const long clampedPos = clampLogicalPosition(logicalPosBefore);
   targetPosition = clampLogicalPosition(logicalTargetBefore);
@@ -640,6 +652,8 @@ void setupWiFi() {
     delay(1000);
     ESP.restart();
   }
+
+  applyWiFiPowerMode();
 }
 
 void setup() {
