@@ -20,6 +20,9 @@ constexpr uint16_t kApPortalTimeoutSec = 180;
 constexpr char kDefaultWifiSsid[] = "nh";
 constexpr char kDefaultWifiPass[] = "Fx110011";
 constexpr uint16_t kDefaultWifiConnectTimeoutMs = 12000;
+constexpr char kDefaultFirmwareRepo[] = "dslimp/shutter";
+constexpr char kDefaultFirmwareAssetName[] = "firmware.bin";
+constexpr char kDefaultFirmwareFsAssetName[] = "littlefs.bin";
 constexpr char kStateFile[] = "/state.json";
 constexpr uint32_t kSaveIntervalMs = 5000;
 constexpr long kMinTravelSteps = 100;
@@ -30,11 +33,11 @@ constexpr float kMinAccel = 40.0f;
 constexpr float kMaxAccel = 6000.0f;
 constexpr uint16_t kMaxCoilHoldMs = 10000;
 
-// 28BYJ-48 + ULN2003 for WeMos D1 mini (ESP8266)
-constexpr uint8_t kPinIn1 = D1;  // GPIO5
-constexpr uint8_t kPinIn2 = D2;  // GPIO4
-constexpr uint8_t kPinIn3 = D5;  // GPIO14
-constexpr uint8_t kPinIn4 = D6;  // GPIO12
+// 28BYJ-48 + ULN2003 for Wemos ESP-WROOM-02 board
+constexpr uint8_t kPinIn1 = 5;   // GPIO5
+constexpr uint8_t kPinIn2 = 4;   // GPIO4
+constexpr uint8_t kPinIn3 = 14;  // GPIO14
+constexpr uint8_t kPinIn4 = 12;  // GPIO12
 }  // namespace cfg
 
 struct ControllerState {
@@ -59,9 +62,25 @@ bool outputsReleased = false;
 long lastSavedPosition = -1;
 uint32_t lastSaveMs = 0;
 uint32_t motionStoppedAtMs = 0;
-String firmwareRepo = "dslimp/shutter";
-String firmwareAssetName = "firmware.bin";
-String firmwareFsAssetName = "littlefs.bin";
+String firmwareRepo = cfg::kDefaultFirmwareRepo;
+String firmwareAssetName = cfg::kDefaultFirmwareAssetName;
+String firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
+
+bool isValidGithubRepo(const String& value) {
+  const int slash = value.indexOf('/');
+  const int length = static_cast<int>(value.length());
+  if (slash <= 0 || slash >= length - 1) return false;
+  return value.indexOf('/', slash + 1) < 0;
+}
+
+void normalizeFirmwareConfig() {
+  firmwareRepo.trim();
+  firmwareAssetName.trim();
+  firmwareFsAssetName.trim();
+  if (firmwareRepo.length() == 0) firmwareRepo = cfg::kDefaultFirmwareRepo;
+  if (firmwareAssetName.length() == 0) firmwareAssetName = cfg::kDefaultFirmwareAssetName;
+  if (firmwareFsAssetName.length() == 0) firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
+}
 
 int directionSign() { return shutter::math::directionSign(state.reverseDirection); }
 
@@ -115,6 +134,12 @@ void fillStateJson(JsonObject root) {
   const long pos = currentLogicalPosition();
   const long tgt = clampLogicalPosition(targetPosition);
   const bool moving = stepper.distanceToGo() != 0;
+  uint32_t adcSum = 0;
+  for (uint8_t i = 0; i < 8; ++i) {
+    adcSum += analogRead(A0);
+    delay(1);
+  }
+  const uint16_t a0Raw = static_cast<uint16_t>(adcSum / 8);
 
   const float posPercent = shutter::math::stepsToPercent(pos, state.travelSteps);
   const float tgtPercent = shutter::math::stepsToPercent(tgt, state.travelSteps);
@@ -130,6 +155,7 @@ void fillStateJson(JsonObject root) {
   root["ip"] = WiFi.isConnected() ? WiFi.localIP().toString() : String("0.0.0.0");
   root["ssid"] = WiFi.SSID();
   root["rssi"] = WiFi.RSSI();
+  root["a0Raw"] = a0Raw;
   root["uptimeSec"] = millis() / 1000;
   root["motion"] = motion;
   root["moving"] = moving;
@@ -172,6 +198,7 @@ bool loadState() {
   firmwareRepo = String(static_cast<const char*>(doc["firmwareRepo"] | firmwareRepo.c_str()));
   firmwareAssetName = String(static_cast<const char*>(doc["firmwareAssetName"] | firmwareAssetName.c_str()));
   firmwareFsAssetName = String(static_cast<const char*>(doc["firmwareFsAssetName"] | firmwareFsAssetName.c_str()));
+  normalizeFirmwareConfig();
   return true;
 }
 
@@ -264,6 +291,15 @@ bool calibrateSetBottom() {
   return true;
 }
 
+void calibrateJog(long logicalDelta) {
+  if (logicalDelta == 0) return;
+  const long rawDelta = logicalDelta * directionSign();
+  const long rawTarget = stepper.currentPosition() + rawDelta;
+  enableMotorOutputs();
+  stepper.moveTo(rawTarget);
+  markDirty();
+}
+
 void handleApiState() {
   StaticJsonDocument<768> doc;
   fillStateJson(doc.to<JsonObject>());
@@ -323,6 +359,13 @@ void handleApiCalibrate() {
       sendError("failed to set bottom");
       return;
     }
+  } else if (strcmp(action, "jog") == 0) {
+    const long delta = body["steps"] | 0;
+    if (delta == 0) {
+      sendError("steps must be non-zero");
+      return;
+    }
+    calibrateJog(delta);
   } else if (strcmp(action, "reset") == 0) {
     state.calibrated = false;
     markDirty();
@@ -373,11 +416,15 @@ void handleApiSettings() {
   stepper.moveTo(logicalToRaw(targetPosition));
 
   markDirty();
-  saveState(true);
+  if (!saveState(true)) {
+    sendError("failed to persist state", 500);
+    return;
+  }
   handleApiState();
 }
 
 void fillFirmwareConfig(JsonObject root) {
+  normalizeFirmwareConfig();
   root["ok"] = true;
   root["firmwareRepo"] = firmwareRepo;
   root["firmwareAssetName"] = firmwareAssetName;
@@ -500,17 +547,17 @@ void handleApiFirmwareConfigPost() {
     firmwareFsAssetName = String(static_cast<const char*>(body["firmwareFsAssetName"] | ""));
   }
 
-  if (firmwareRepo.length() == 0 || firmwareRepo.indexOf('/') <= 0) {
+  normalizeFirmwareConfig();
+  if (!isValidGithubRepo(firmwareRepo)) {
     sendError("firmwareRepo must be owner/repo");
-    return;
-  }
-  if (firmwareAssetName.length() == 0 || firmwareFsAssetName.length() == 0) {
-    sendError("asset names must be non-empty");
     return;
   }
 
   markDirty();
-  saveState(true);
+  if (!saveState(true)) {
+    sendError("failed to persist state", 500);
+    return;
+  }
   handleApiFirmwareConfigGet();
 }
 
@@ -542,7 +589,8 @@ void handleApiFirmwareUpdateLatest() {
   const bool hasBody = parseJsonBody(body);
   const bool includeFilesystem = hasBody ? (body["includeFilesystem"] | true) : true;
 
-  if (firmwareRepo.indexOf('/') <= 0) {
+  normalizeFirmwareConfig();
+  if (!isValidGithubRepo(firmwareRepo)) {
     sendError("firmwareRepo must be owner/repo");
     return;
   }
@@ -566,7 +614,8 @@ void handleApiFirmwareUpdateLatest() {
 }
 
 void handleApiFirmwareCheckLatest() {
-  if (firmwareRepo.indexOf('/') <= 0) {
+  normalizeFirmwareConfig();
+  if (!isValidGithubRepo(firmwareRepo)) {
     sendError("firmwareRepo must be owner/repo");
     return;
   }
@@ -595,6 +644,9 @@ void handleApiFirmwareCheckLatest() {
   JsonObject fs = doc.createNestedObject("filesystem");
   fs["ok"] = !includeFilesystem || (fsUrlFormatOk && networkOk);
   fs["urlFormatOk"] = fsUrlFormatOk;
+  if (!(doc["ok"].as<bool>())) {
+    doc["error"] = networkOk ? "invalid latest url configuration" : (netErr.length() ? netErr : "network unavailable");
+  }
 
   if (!(doc["ok"].as<bool>())) {
     sendJsonDocument(502, doc);

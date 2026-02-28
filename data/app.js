@@ -75,6 +75,7 @@ function renderState(state) {
   document.getElementById('chipMotion').textContent = MOTION_NAMES[state.motion] || state.motion || '-';
   document.getElementById('chipPos').textContent = `${posPercent.toFixed(1)}%`;
   document.getElementById('chipWifi').textContent = state.ssid ? `${state.ssid} (${state.rssi}dBm)` : 'offline';
+  document.getElementById('chipA0').textContent = Number(state.a0Raw ?? 0).toFixed(0);
 
   document.getElementById('motionName').textContent = MOTION_NAMES[state.motion] || state.motion || '-';
   document.getElementById('calibName').textContent = state.calibrated ? 'Выполнена' : 'Не выполнена';
@@ -160,7 +161,12 @@ function calJogUp() {
     setStatus('Укажите шаги для калибровки', true);
     return;
   }
-  moveAction('jog', { steps: -steps });
+  req('/api/calibrate', 'POST', { action: 'jog', steps: -steps })
+    .then((state) => {
+      renderState(state);
+      setStatus('Калибровочный джог выполнен');
+    })
+    .catch((error) => setStatus(`Ошибка калибровки: ${error.message}`, true));
 }
 
 function calJogDown() {
@@ -169,7 +175,12 @@ function calJogDown() {
     setStatus('Укажите шаги для калибровки', true);
     return;
   }
-  moveAction('jog', { steps });
+  req('/api/calibrate', 'POST', { action: 'jog', steps })
+    .then((state) => {
+      renderState(state);
+      setStatus('Калибровочный джог выполнен');
+    })
+    .catch((error) => setStatus(`Ошибка калибровки: ${error.message}`, true));
 }
 
 async function setTop() {

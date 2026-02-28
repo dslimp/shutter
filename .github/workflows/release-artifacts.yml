@@ -35,10 +35,10 @@ jobs:
           echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Build firmware binary
-        run: pio run -e d1_mini
+        run: pio run -e wroom_02
 
       - name: Build filesystem image
-        run: pio run -e d1_mini -t buildfs
+        run: pio run -e wroom_02 -t buildfs
 
       - name: Run unit tests
         run: pio test -e native
@@ -46,8 +46,8 @@ jobs:
       - name: Prepare artifact bundle
         run: |
           mkdir -p release-bundle
-          cp .pio/build/d1_mini/firmware.bin release-bundle/
-          cp .pio/build/d1_mini/littlefs.bin release-bundle/
+          cp .pio/build/wroom_02/firmware.bin release-bundle/
+          cp .pio/build/wroom_02/littlefs.bin release-bundle/
           cp VERSION release-bundle/
           cp CHANGELOG.md release-bundle/
           printf "branch=%s\ncommit=%s\n" "${GITHUB_REF_NAME}" "${GITHUB_SHA}" > release-bundle/build-info.txt

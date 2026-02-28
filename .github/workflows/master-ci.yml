@@ -24,10 +24,10 @@ jobs:
           pip install platformio
 
       - name: Build firmware binary
-        run: pio run -e d1_mini
+        run: pio run -e wroom_02
 
       - name: Build filesystem image
-        run: pio run -e d1_mini -t buildfs
+        run: pio run -e wroom_02 -t buildfs
 
       - name: Run unit tests
         run: pio test -e native
@@ -35,12 +35,12 @@ jobs:
       - name: Prepare build artifact bundle
         run: |
           mkdir -p build-bundle
-          cp .pio/build/d1_mini/firmware.bin build-bundle/
-          cp .pio/build/d1_mini/littlefs.bin build-bundle/
+          cp .pio/build/wroom_02/firmware.bin build-bundle/
+          cp .pio/build/wroom_02/littlefs.bin build-bundle/
 
       - name: Upload firmware artifact bundle
         uses: actions/upload-artifact@v4
         with:
-          name: esp8266-d1-mini-build-bundle
+          name: esp8266-wroom02-build-bundle
           path: build-bundle/
           if-no-files-found: error
