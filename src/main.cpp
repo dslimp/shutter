@@ -456,6 +456,26 @@ bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessa
   return true;
 }
 
+bool probeGithubTcp(String* errorMessage) {
+  if (errorMessage) errorMessage->clear();
+
+  IPAddress ip;
+  if (!WiFi.hostByName("github.com", ip)) {
+    if (errorMessage) *errorMessage = "dns lookup failed";
+    return false;
+  }
+
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(3000);
+  if (!client.connect(ip, 443)) {
+    if (errorMessage) *errorMessage = "tcp connect failed";
+    return false;
+  }
+  client.stop();
+  return true;
+}
+
 
 void handleApiFirmwareConfigGet() {
   StaticJsonDocument<384> doc;
@@ -545,6 +565,44 @@ void handleApiFirmwareUpdateLatest() {
   ESP.restart();
 }
 
+void handleApiFirmwareCheckLatest() {
+  if (firmwareRepo.indexOf('/') <= 0) {
+    sendError("firmwareRepo must be owner/repo");
+    return;
+  }
+
+  StaticJsonDocument<192> body;
+  const bool hasBody = parseJsonBody(body);
+  const bool includeFilesystem = hasBody ? (body["includeFilesystem"] | true) : true;
+
+  const String firmwareUrl = "https://github.com/" + firmwareRepo + "/releases/latest/download/" + firmwareAssetName;
+  const String filesystemUrl = "https://github.com/" + firmwareRepo + "/releases/latest/download/" + firmwareFsAssetName;
+
+  const bool fwUrlFormatOk = firmwareUrl.startsWith("https://");
+  const bool fsUrlFormatOk = filesystemUrl.startsWith("https://");
+  String netErr;
+  const bool networkOk = probeGithubTcp(&netErr);
+
+  StaticJsonDocument<1024> doc;
+  doc["ok"] = fwUrlFormatOk && (!includeFilesystem || fsUrlFormatOk) && networkOk;
+  doc["firmwareUrl"] = firmwareUrl;
+  doc["filesystemUrl"] = filesystemUrl;
+  doc["networkOk"] = networkOk;
+  doc["networkError"] = netErr;
+  JsonObject fw = doc.createNestedObject("firmware");
+  fw["ok"] = fwUrlFormatOk && networkOk;
+  fw["urlFormatOk"] = fwUrlFormatOk;
+  JsonObject fs = doc.createNestedObject("filesystem");
+  fs["ok"] = !includeFilesystem || (fsUrlFormatOk && networkOk);
+  fs["urlFormatOk"] = fsUrlFormatOk;
+
+  if (!(doc["ok"].as<bool>())) {
+    sendJsonDocument(502, doc);
+    return;
+  }
+  sendJsonDocument(200, doc);
+}
+
 
 void handleApiFirmwareUpdateUrl() {
   StaticJsonDocument<768> body;
@@ -623,6 +681,7 @@ void setupWebServer() {
   server.on("/api/system/reboot", HTTP_POST, handleApiReboot);
   server.on("/api/firmware/config", HTTP_GET, handleApiFirmwareConfigGet);
   server.on("/api/firmware/config", HTTP_POST, handleApiFirmwareConfigPost);
+  server.on("/api/firmware/check/latest", HTTP_POST, handleApiFirmwareCheckLatest);
   server.on("/api/firmware/update/latest", HTTP_POST, handleApiFirmwareUpdateLatest);
   server.on("/api/firmware/update/url", HTTP_POST, handleApiFirmwareUpdateUrl);
 

@@ -270,6 +270,18 @@ async function updateFirmwareLatest() {
   }
 }
 
+async function checkFirmwareLatestUrls() {
+  setFwStatus('Проверка latest URL...');
+  try {
+    const res = await req('/api/firmware/check/latest', 'POST', { includeFilesystem: true });
+    const fw = res.firmware || {};
+    const fs = res.filesystem || {};
+    setFwStatus(`OK: network=${res.networkOk}, fw=${fw.ok}, fs=${fs.ok}`);
+  } catch (error) {
+    setFwStatus(`Проверка latest URL: ${error.message}`, true);
+  }
+}
+
 async function updateFirmwareFromUrl() {
   const firmwareUrl = document.getElementById('fwUrl').value.trim();
   const filesystemUrl = document.getElementById('fwFsUrl').value.trim();

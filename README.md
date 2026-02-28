@@ -71,6 +71,7 @@ pio run -t uploadfs
 - `POST /api/wifi/reset` — сброс Wi-Fi и перезагрузка
 - `POST /api/system/reboot` — перезагрузка без сброса Wi-Fi
 - `GET/POST /api/firmware/config` — OTA repo и имена ассетов
+- `POST /api/firmware/check/latest` — проверка доступности latest URL (firmware/fs)
 - `POST /api/firmware/update/latest` — обновление до последнего релиза
 - `POST /api/firmware/update/url` — обновление по прямым URL
 
