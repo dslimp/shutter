@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.11] - 2026-02-28
+
+- Added autonomous schedule based on NTP time + timezone + sunrise/sunset calculation:
+  - persisted settings: `timezone`, `sunScheduleEnabled`, `latitude`, `longitude`,
+    `sunriseOffsetMinutes`, `sunsetOffsetMinutes`, `sunriseTargetPercent`, `sunsetTargetPercent`,
+  - runtime fields in `/api/state`: `timeSynced`, `localTime`, `sunriseTime`, `sunsetTime`, daily execution flags.
+- Fixed sunrise/sunset date/longitude calculation to use east-positive device coordinates correctly.
+- Improved watchdog stability under frequent `/api/state` polling:
+  - moved large JSON response doc to static storage to reduce per-request stack pressure.
+- Added EEPROM forward migration hardening:
+  - schema `v1 -> v2` migrator in loader,
+  - one-time rewrite to current schema immediately after legacy state is loaded,
+  - prevents settings loss on future firmware updates.
+
 ## [0.1.10] - 2026-02-28
 
 - OTA architecture update for ESP8266 stability:

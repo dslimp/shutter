@@ -17,7 +17,7 @@
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.10-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.11-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
