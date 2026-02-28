@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.10] - 2026-02-28
+
+- OTA architecture update for ESP8266 stability:
+  - firmware update endpoints (`latest`, `release`, `url`) now queue OTA jobs and return `202` immediately,
+  - OTA execution moved out of HTTP handler into main loop worker to avoid watchdog resets during HTTPS download.
+- OTA robustness tuning:
+  - retry count increased to `4` attempts,
+  - client timeout increased to `20000` ms,
+  - retry backoff increased to `2500` ms,
+  - queued OTA start delay (`400` ms) added to let HTTP response flush before OTA begins.
+- OTA diagnostics in `/api/state`:
+  - `otaPending`, `otaRunning`, `otaSource`, `otaTag`, `otaPhase`, `otaLastError`, `otaQueuedSec`, `otaRunningSec`.
+
 ## [0.1.9] - 2026-02-28
 
 - OTA reliability hardening for ESP8266:
