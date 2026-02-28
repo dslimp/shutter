@@ -92,6 +92,8 @@ function renderState(state) {
   setInputValue('coilHoldMs', state.coilHoldMs);
   setCheckboxValue('reverseDirection', state.reverseDirection);
   setCheckboxValue('wifiModemSleep', state.wifiModemSleep);
+  setCheckboxValue('topOverdriveEnabled', state.topOverdriveEnabled);
+  setInputValue('topOverdrivePercent', Number(state.topOverdrivePercent ?? 10).toFixed(0));
   setTextValue('fwRepo', state.firmwareRepo || '');
   setTextValue('fwAssetName', state.firmwareAssetName || 'firmware.bin');
   setTextValue('fwFsAssetName', state.firmwareFsAssetName || 'littlefs.bin');
@@ -218,10 +220,12 @@ async function saveSettings() {
   const payload = {
     reverseDirection: document.getElementById('reverseDirection').checked,
     wifiModemSleep: document.getElementById('wifiModemSleep').checked,
+    topOverdriveEnabled: document.getElementById('topOverdriveEnabled').checked,
     travelSteps: Number(document.getElementById('travelSteps').value),
     maxSpeed: Number(document.getElementById('maxSpeed').value),
     acceleration: Number(document.getElementById('acceleration').value),
     coilHoldMs: Number(document.getElementById('coilHoldMs').value),
+    topOverdrivePercent: Number(document.getElementById('topOverdrivePercent').value),
   };
 
   try {
@@ -319,24 +323,25 @@ async function loadFirmwareReleases() {
 
   setFwStatus('Загрузка релизов...');
   try {
-    const response = await fetch(`https://api.github.com/repos/${repo}/tags?per_page=20`, {
+    const response = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=20`, {
       headers: { Accept: 'application/vnd.github+json' },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    const tags = await response.json();
-    const releases = (Array.isArray(tags) ? tags : []).map((item) => {
-      const tag = String(item?.name || '');
+    const releasesRaw = await response.json();
+    const releases = (Array.isArray(releasesRaw) ? releasesRaw : []).map((item) => {
+      const tag = String(item?.tag_name || '');
+      const name = String(item?.name || '');
       return {
         tag,
-        name: tag,
-        prerelease: false,
-        draft: false,
-        publishedAt: '',
+        name: name || tag,
+        prerelease: Boolean(item?.prerelease),
+        draft: Boolean(item?.draft),
+        publishedAt: String(item?.published_at || ''),
         firmwareUrl: `https://github.com/${repo}/releases/download/${tag}/${fwAsset}`,
         filesystemUrl: `https://github.com/${repo}/releases/download/${tag}/${fsAsset}`,
       };
-    }).filter((item) => item.tag.length > 0);
+    }).filter((item) => item.tag.length > 0 && !item.draft);
 
     renderFirmwareReleases(releases);
     setFwStatus(`Релизы загружены: ${releases.length}`);
@@ -399,7 +404,7 @@ async function updateFirmwareFromUrl() {
 
 showTab('control');
 
-['travelSteps', 'maxSpeed', 'acceleration', 'coilHoldMs', 'reverseDirection', 'wifiModemSleep'].forEach((id) => {
+['travelSteps', 'maxSpeed', 'acceleration', 'coilHoldMs', 'topOverdrivePercent', 'reverseDirection', 'wifiModemSleep', 'topOverdriveEnabled'].forEach((id) => {
   const el = document.getElementById(id);
   if (!el) return;
   el.addEventListener('input', () => { settingsDirty = true; });

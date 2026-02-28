@@ -2,18 +2,20 @@
 #include <AccelStepper.h>
 #include <ArduinoJson.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <Updater.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <LittleFS.h>
+#include <EEPROM.h>
 #include <WiFiManager.h>
 #include <memory>
 
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.3-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.10-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
@@ -23,7 +25,14 @@ constexpr uint16_t kDefaultWifiConnectTimeoutMs = 12000;
 constexpr char kDefaultFirmwareRepo[] = "dslimp/shutter";
 constexpr char kDefaultFirmwareAssetName[] = "firmware.bin";
 constexpr char kDefaultFirmwareFsAssetName[] = "littlefs.bin";
+constexpr uint8_t kOtaMaxAttempts = 4;
+constexpr uint16_t kOtaClientTimeoutMs = 20000;
+constexpr uint16_t kOtaRetryDelayMs = 2500;
+constexpr uint16_t kOtaQueueStartDelayMs = 400;
 constexpr char kStateFile[] = "/state.json";
+constexpr uint16_t kEepromSize = 512;
+constexpr uint32_t kStateMagic = 0x53485452;  // "SHTR"
+constexpr uint16_t kStateSchemaVersion = 1;
 constexpr uint32_t kSaveIntervalMs = 5000;
 constexpr long kMinTravelSteps = 100;
 constexpr long kMaxTravelSteps = 300000;
@@ -32,6 +41,8 @@ constexpr float kMaxSpeed = 2500.0f;
 constexpr float kMinAccel = 40.0f;
 constexpr float kMaxAccel = 6000.0f;
 constexpr uint16_t kMaxCoilHoldMs = 10000;
+constexpr float kMinTopOverdrivePercent = 0.0f;
+constexpr float kMaxTopOverdrivePercent = 50.0f;
 
 // 28BYJ-48 + ULN2003 for Wemos ESP-WROOM-02 board
 constexpr uint8_t kPinIn1 = 5;   // GPIO5
@@ -46,9 +57,31 @@ struct ControllerState {
   bool calibrated = false;
   bool reverseDirection = false;
   bool wifiModemSleep = false;
+  bool topOverdriveEnabled = true;
   float maxSpeed = 700.0f;
   float acceleration = 350.0f;
+  float topOverdrivePercent = 10.0f;
   uint16_t coilHoldMs = 500;
+};
+
+struct PersistedStateBlob {
+  uint32_t magic;
+  uint16_t schemaVersion;
+  uint16_t structSize;
+  int32_t travelSteps;
+  int32_t currentPosition;
+  uint8_t calibrated;
+  uint8_t reverseDirection;
+  uint8_t wifiModemSleep;
+  uint8_t topOverdriveEnabled;
+  float maxSpeed;
+  float acceleration;
+  float topOverdrivePercent;
+  uint16_t coilHoldMs;
+  char firmwareRepo[64];
+  char firmwareAssetName[32];
+  char firmwareFsAssetName[32];
+  uint32_t checksum;
 };
 
 ESP8266WebServer server(80);
@@ -62,9 +95,32 @@ bool outputsReleased = false;
 long lastSavedPosition = -1;
 uint32_t lastSaveMs = 0;
 uint32_t motionStoppedAtMs = 0;
+bool resetTopReferenceWhenStopped = false;
 String firmwareRepo = cfg::kDefaultFirmwareRepo;
 String firmwareAssetName = cfg::kDefaultFirmwareAssetName;
 String firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
+bool eepromReady = false;
+
+struct OtaJobState {
+  bool pending = false;
+  bool running = false;
+  bool rebootScheduled = false;
+  bool includeFilesystem = true;
+  String firmwareUrl;
+  String filesystemUrl;
+  String source;
+  String tag;
+  String phase;
+  String lastError;
+  uint32_t queuedAtMs = 0;
+  uint32_t startedAtMs = 0;
+};
+
+OtaJobState otaJob;
+
+#if defined(OTA_FW_PAD_BYTES) && (OTA_FW_PAD_BYTES > 0)
+__attribute__((used)) const uint8_t kOtaFirmwarePad[OTA_FW_PAD_BYTES] PROGMEM = {0xA5};
+#endif
 
 bool isValidGithubRepo(const String& value) {
   const int slash = value.indexOf('/');
@@ -80,6 +136,73 @@ void normalizeFirmwareConfig() {
   if (firmwareRepo.length() == 0) firmwareRepo = cfg::kDefaultFirmwareRepo;
   if (firmwareAssetName.length() == 0) firmwareAssetName = cfg::kDefaultFirmwareAssetName;
   if (firmwareFsAssetName.length() == 0) firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
+}
+
+uint32_t computeChecksum(const uint8_t* data, size_t length) {
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < length; ++i) {
+    hash ^= data[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+void copyStringField(char* dst, size_t dstSize, const String& src) {
+  if (dstSize == 0) return;
+  memset(dst, 0, dstSize);
+  src.substring(0, dstSize - 1).toCharArray(dst, dstSize);
+}
+
+String parseStringField(const char* src, size_t srcSize) {
+  size_t len = 0;
+  while (len < srcSize && src[len] != '\0') ++len;
+  return String(src).substring(0, len);
+}
+
+void fillPersistedBlob(PersistedStateBlob* blob, long pos) {
+  memset(blob, 0, sizeof(PersistedStateBlob));
+  blob->magic = cfg::kStateMagic;
+  blob->schemaVersion = cfg::kStateSchemaVersion;
+  blob->structSize = sizeof(PersistedStateBlob);
+  blob->travelSteps = static_cast<int32_t>(state.travelSteps);
+  blob->currentPosition = static_cast<int32_t>(pos);
+  blob->calibrated = state.calibrated ? 1 : 0;
+  blob->reverseDirection = state.reverseDirection ? 1 : 0;
+  blob->wifiModemSleep = state.wifiModemSleep ? 1 : 0;
+  blob->topOverdriveEnabled = state.topOverdriveEnabled ? 1 : 0;
+  blob->maxSpeed = state.maxSpeed;
+  blob->acceleration = state.acceleration;
+  blob->topOverdrivePercent = state.topOverdrivePercent;
+  blob->coilHoldMs = state.coilHoldMs;
+  copyStringField(blob->firmwareRepo, sizeof(blob->firmwareRepo), firmwareRepo);
+  copyStringField(blob->firmwareAssetName, sizeof(blob->firmwareAssetName), firmwareAssetName);
+  copyStringField(blob->firmwareFsAssetName, sizeof(blob->firmwareFsAssetName), firmwareFsAssetName);
+  blob->checksum = computeChecksum(reinterpret_cast<const uint8_t*>(blob), sizeof(PersistedStateBlob) - sizeof(uint32_t));
+}
+
+bool applyPersistedBlob(const PersistedStateBlob& blob) {
+  if (blob.magic != cfg::kStateMagic) return false;
+  if (blob.schemaVersion != cfg::kStateSchemaVersion) return false;
+  if (blob.structSize != sizeof(PersistedStateBlob)) return false;
+  const uint32_t expected = computeChecksum(reinterpret_cast<const uint8_t*>(&blob), sizeof(PersistedStateBlob) - sizeof(uint32_t));
+  if (blob.checksum != expected) return false;
+
+  state.travelSteps = shutter::math::clampLong(blob.travelSteps, cfg::kMinTravelSteps, cfg::kMaxTravelSteps);
+  state.currentPosition = shutter::math::clampLong(blob.currentPosition, 0, state.travelSteps);
+  state.calibrated = blob.calibrated != 0;
+  state.reverseDirection = blob.reverseDirection != 0;
+  state.wifiModemSleep = blob.wifiModemSleep != 0;
+  state.topOverdriveEnabled = blob.topOverdriveEnabled != 0;
+  state.maxSpeed = shutter::math::clampFloat(blob.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
+  state.acceleration = shutter::math::clampFloat(blob.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
+  state.topOverdrivePercent =
+      shutter::math::clampFloat(blob.topOverdrivePercent, cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
+  state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(blob.coilHoldMs, 0, cfg::kMaxCoilHoldMs));
+  firmwareRepo = parseStringField(blob.firmwareRepo, sizeof(blob.firmwareRepo));
+  firmwareAssetName = parseStringField(blob.firmwareAssetName, sizeof(blob.firmwareAssetName));
+  firmwareFsAssetName = parseStringField(blob.firmwareFsAssetName, sizeof(blob.firmwareFsAssetName));
+  normalizeFirmwareConfig();
+  return true;
 }
 
 int directionSign() { return shutter::math::directionSign(state.reverseDirection); }
@@ -134,6 +257,7 @@ void fillStateJson(JsonObject root) {
   const long pos = currentLogicalPosition();
   const long tgt = clampLogicalPosition(targetPosition);
   const bool moving = stepper.distanceToGo() != 0;
+  const uint32_t nowMs = millis();
   uint32_t adcSum = 0;
   for (uint8_t i = 0; i < 8; ++i) {
     adcSum += analogRead(A0);
@@ -167,6 +291,8 @@ void fillStateJson(JsonObject root) {
   root["targetPercent"] = tgtPercent;
   root["reverseDirection"] = state.reverseDirection;
   root["wifiModemSleep"] = state.wifiModemSleep;
+  root["topOverdriveEnabled"] = state.topOverdriveEnabled;
+  root["topOverdrivePercent"] = state.topOverdrivePercent;
   root["maxSpeed"] = state.maxSpeed;
   root["acceleration"] = state.acceleration;
   root["coilHoldMs"] = state.coilHoldMs;
@@ -174,9 +300,17 @@ void fillStateJson(JsonObject root) {
   root["firmwareRepo"] = firmwareRepo;
   root["firmwareAssetName"] = firmwareAssetName;
   root["firmwareFsAssetName"] = firmwareFsAssetName;
+  root["otaPending"] = otaJob.pending;
+  root["otaRunning"] = otaJob.running;
+  root["otaSource"] = otaJob.source;
+  root["otaTag"] = otaJob.tag;
+  root["otaPhase"] = otaJob.phase;
+  root["otaLastError"] = otaJob.lastError;
+  root["otaQueuedSec"] = otaJob.queuedAtMs > 0 ? (nowMs - otaJob.queuedAtMs) / 1000 : 0;
+  root["otaRunningSec"] = otaJob.startedAtMs > 0 ? (nowMs - otaJob.startedAtMs) / 1000 : 0;
 }
 
-bool loadState() {
+bool loadStateFromLegacyFs() {
   if (!LittleFS.exists(cfg::kStateFile)) return false;
 
   File file = LittleFS.open(cfg::kStateFile, "r");
@@ -192,13 +326,65 @@ bool loadState() {
   state.calibrated = doc["calibrated"] | state.calibrated;
   state.reverseDirection = doc["reverseDirection"] | state.reverseDirection;
   state.wifiModemSleep = doc["wifiModemSleep"] | state.wifiModemSleep;
+  state.topOverdriveEnabled = doc["topOverdriveEnabled"] | state.topOverdriveEnabled;
   state.maxSpeed = shutter::math::clampFloat(doc["maxSpeed"] | state.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
   state.acceleration = shutter::math::clampFloat(doc["acceleration"] | state.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
+  state.topOverdrivePercent = shutter::math::clampFloat(
+      doc["topOverdrivePercent"] | state.topOverdrivePercent, cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
   state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(doc["coilHoldMs"] | state.coilHoldMs, 0, cfg::kMaxCoilHoldMs));
   firmwareRepo = String(static_cast<const char*>(doc["firmwareRepo"] | firmwareRepo.c_str()));
   firmwareAssetName = String(static_cast<const char*>(doc["firmwareAssetName"] | firmwareAssetName.c_str()));
   firmwareFsAssetName = String(static_cast<const char*>(doc["firmwareFsAssetName"] | firmwareFsAssetName.c_str()));
   normalizeFirmwareConfig();
+  return true;
+}
+
+bool loadStateFromEeprom() {
+  if (!eepromReady) return false;
+  PersistedStateBlob blob;
+  EEPROM.get(0, blob);
+  return applyPersistedBlob(blob);
+}
+
+bool saveStateToEeprom(long pos) {
+  if (!eepromReady) return false;
+  PersistedStateBlob blob;
+  fillPersistedBlob(&blob, pos);
+  EEPROM.put(0, blob);
+  return EEPROM.commit();
+}
+
+bool saveStateToLegacyFs(long pos) {
+  StaticJsonDocument<1024> doc;
+  doc["travelSteps"] = state.travelSteps;
+  doc["currentPosition"] = pos;
+  doc["calibrated"] = state.calibrated;
+  doc["reverseDirection"] = state.reverseDirection;
+  doc["wifiModemSleep"] = state.wifiModemSleep;
+  doc["topOverdriveEnabled"] = state.topOverdriveEnabled;
+  doc["maxSpeed"] = state.maxSpeed;
+  doc["acceleration"] = state.acceleration;
+  doc["topOverdrivePercent"] = state.topOverdrivePercent;
+  doc["coilHoldMs"] = state.coilHoldMs;
+  doc["firmwareRepo"] = firmwareRepo;
+  doc["firmwareAssetName"] = firmwareAssetName;
+  doc["firmwareFsAssetName"] = firmwareFsAssetName;
+
+  File file = LittleFS.open(cfg::kStateFile, "w");
+  if (!file) return false;
+  if (serializeJson(doc, file) == 0) {
+    file.close();
+    return false;
+  }
+  file.close();
+  return true;
+}
+
+bool loadState() {
+  if (loadStateFromEeprom()) return true;
+  if (!loadStateFromLegacyFs()) return false;
+  const long pos = shutter::math::clampLong(state.currentPosition, 0, state.travelSteps);
+  saveStateToEeprom(pos);
   return true;
 }
 
@@ -211,27 +397,8 @@ bool saveState(bool force = false) {
     if (now - lastSaveMs < cfg::kSaveIntervalMs) return true;
   }
 
-  StaticJsonDocument<1024> doc;
-  doc["travelSteps"] = state.travelSteps;
-  doc["currentPosition"] = pos;
-  doc["calibrated"] = state.calibrated;
-  doc["reverseDirection"] = state.reverseDirection;
-  doc["wifiModemSleep"] = state.wifiModemSleep;
-  doc["maxSpeed"] = state.maxSpeed;
-  doc["acceleration"] = state.acceleration;
-  doc["coilHoldMs"] = state.coilHoldMs;
-  doc["firmwareRepo"] = firmwareRepo;
-  doc["firmwareAssetName"] = firmwareAssetName;
-  doc["firmwareFsAssetName"] = firmwareFsAssetName;
-
-  File file = LittleFS.open(cfg::kStateFile, "w");
-  if (!file) return false;
-  if (serializeJson(doc, file) == 0) {
-    file.close();
-    return false;
-  }
-
-  file.close();
+  if (!saveStateToEeprom(pos)) return false;
+  saveStateToLegacyFs(pos);
   lastSavedPosition = pos;
   lastSaveMs = now;
   settingsDirty = false;
@@ -251,13 +418,41 @@ void disableMotorOutputs() {
 }
 
 void setTargetPosition(long logicalTarget) {
+  resetTopReferenceWhenStopped = false;
   targetPosition = clampLogicalPosition(logicalTarget);
   enableMotorOutputs();
   stepper.moveTo(logicalToRaw(targetPosition));
   markDirty();
 }
 
+void setTargetRawWithLogical(long rawTarget, long logicalTarget) {
+  targetPosition = clampLogicalPosition(logicalTarget);
+  enableMotorOutputs();
+  stepper.moveTo(rawTarget);
+  markDirty();
+}
+
+void startOpenMotion() {
+  if (!state.topOverdriveEnabled || state.topOverdrivePercent <= 0.0f) {
+    setTargetPosition(0);
+    return;
+  }
+
+  const float clampedPercent =
+      shutter::math::clampFloat(state.topOverdrivePercent, cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
+  const long extraSteps = static_cast<long>(lroundf((clampedPercent / 100.0f) * static_cast<float>(state.travelSteps)));
+  if (extraSteps <= 0) {
+    setTargetPosition(0);
+    return;
+  }
+
+  resetTopReferenceWhenStopped = true;
+  const long rawTarget = logicalToRaw(-extraSteps);
+  setTargetRawWithLogical(rawTarget, 0);
+}
+
 void stopMotor() {
+  resetTopReferenceWhenStopped = false;
   const long rawNow = stepper.currentPosition();
   stepper.setCurrentPosition(rawNow);
   stepper.moveTo(rawNow);
@@ -267,6 +462,7 @@ void stopMotor() {
 }
 
 void calibrateSetTop() {
+  resetTopReferenceWhenStopped = false;
   stepper.setCurrentPosition(logicalToRaw(0));
   targetPosition = 0;
   stepper.moveTo(logicalToRaw(targetPosition));
@@ -275,6 +471,7 @@ void calibrateSetTop() {
 }
 
 bool calibrateSetBottom() {
+  resetTopReferenceWhenStopped = false;
   long measured = rawToLogical(stepper.currentPosition());
   if (measured < 0) measured = -measured;
   measured = shutter::math::clampLong(measured, cfg::kMinTravelSteps, cfg::kMaxTravelSteps);
@@ -293,6 +490,7 @@ bool calibrateSetBottom() {
 
 void calibrateJog(long logicalDelta) {
   if (logicalDelta == 0) return;
+  resetTopReferenceWhenStopped = false;
   const long rawDelta = logicalDelta * directionSign();
   const long rawTarget = stepper.currentPosition() + rawDelta;
   enableMotorOutputs();
@@ -301,7 +499,7 @@ void calibrateJog(long logicalDelta) {
 }
 
 void handleApiState() {
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   fillStateJson(doc.to<JsonObject>());
   sendJsonDocument(200, doc);
 }
@@ -316,7 +514,7 @@ void handleApiMove() {
   const char* action = body["action"] | "";
 
   if (strcmp(action, "open") == 0) {
-    setTargetPosition(0);
+    startOpenMotion();
   } else if (strcmp(action, "close") == 0) {
     setTargetPosition(state.travelSteps);
   } else if (strcmp(action, "stop") == 0) {
@@ -352,13 +550,16 @@ void handleApiCalibrate() {
   }
 
   const char* action = body["action"] | "";
+  bool shouldPersistNow = false;
   if (strcmp(action, "set_top") == 0) {
     calibrateSetTop();
+    shouldPersistNow = true;
   } else if (strcmp(action, "set_bottom") == 0) {
     if (!calibrateSetBottom()) {
       sendError("failed to set bottom");
       return;
     }
+    shouldPersistNow = true;
   } else if (strcmp(action, "jog") == 0) {
     const long delta = body["steps"] | 0;
     if (delta == 0) {
@@ -369,8 +570,14 @@ void handleApiCalibrate() {
   } else if (strcmp(action, "reset") == 0) {
     state.calibrated = false;
     markDirty();
+    shouldPersistNow = true;
   } else {
     sendError("unknown action");
+    return;
+  }
+
+  if (shouldPersistNow && !saveState(true)) {
+    sendError("failed to persist state", 500);
     return;
   }
 
@@ -393,11 +600,18 @@ void handleApiSettings() {
   if (body.containsKey("wifiModemSleep")) {
     state.wifiModemSleep = body["wifiModemSleep"].as<bool>();
   }
+  if (body.containsKey("topOverdriveEnabled")) {
+    state.topOverdriveEnabled = body["topOverdriveEnabled"].as<bool>();
+  }
   if (body.containsKey("maxSpeed")) {
     state.maxSpeed = shutter::math::clampFloat(body["maxSpeed"].as<float>(), cfg::kMinSpeed, cfg::kMaxSpeed);
   }
   if (body.containsKey("acceleration")) {
     state.acceleration = shutter::math::clampFloat(body["acceleration"].as<float>(), cfg::kMinAccel, cfg::kMaxAccel);
+  }
+  if (body.containsKey("topOverdrivePercent")) {
+    state.topOverdrivePercent =
+        shutter::math::clampFloat(body["topOverdrivePercent"].as<float>(), cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
   }
   if (body.containsKey("coilHoldMs")) {
     state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(body["coilHoldMs"].as<long>(), 0, cfg::kMaxCoilHoldMs));
@@ -414,6 +628,7 @@ void handleApiSettings() {
 
   stepper.setCurrentPosition(logicalToRaw(clampedPos));
   stepper.moveTo(logicalToRaw(targetPosition));
+  resetTopReferenceWhenStopped = false;
 
   markDirty();
   if (!saveState(true)) {
@@ -440,68 +655,66 @@ bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessa
     if (errorMessage) *errorMessage = "unsupported url scheme";
     return false;
   }
+  ESPhttpUpdate.rebootOnUpdate(false);
+  ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  const char* targetName = updateFilesystem ? "filesystem" : "firmware";
+  int lastErr = 0;
+  String lastErrText = "unknown";
 
-  HTTPClient http;
-  http.setTimeout(60000);
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  WiFiClient plainClient;
-  std::unique_ptr<BearSSL::WiFiClientSecure> secureClient(new BearSSL::WiFiClientSecure());
-  if (isHttps) secureClient->setInsecure();
+  for (uint8_t attempt = 1; attempt <= cfg::kOtaMaxAttempts; ++attempt) {
+    delay(1);
+    yield();
+    if (WiFi.status() != WL_CONNECTED) {
+      if (errorMessage) *errorMessage = "wifi disconnected before OTA";
+      Serial.printf("[OTA] %s attempt %u/%u skipped: wifi disconnected\n",
+                    targetName, attempt, cfg::kOtaMaxAttempts);
+      return false;
+    }
 
-  const bool beginOk = isHttps ? http.begin(*secureClient, url) : http.begin(plainClient, url);
-  if (!beginOk) {
-    if (errorMessage) *errorMessage = "http begin failed";
-    return false;
+    Serial.printf("[OTA] %s attempt %u/%u, timeout=%ums, rssi=%d, heap=%u, url=%s\n",
+                  targetName, attempt, cfg::kOtaMaxAttempts, cfg::kOtaClientTimeoutMs,
+                  WiFi.RSSI(), ESP.getFreeHeap(), url.c_str());
+
+    t_httpUpdate_return result = HTTP_UPDATE_FAILED;
+    if (isHttps) {
+      std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
+      client->setInsecure();
+      client->setTimeout(cfg::kOtaClientTimeoutMs);
+      if (updateFilesystem) {
+        result = ESPhttpUpdate.updateFS(*client, url);
+      } else {
+        result = ESPhttpUpdate.update(*client, url);
+      }
+    } else {
+      WiFiClient client;
+      client.setTimeout(cfg::kOtaClientTimeoutMs);
+      if (updateFilesystem) {
+        result = ESPhttpUpdate.updateFS(client, url);
+      } else {
+        result = ESPhttpUpdate.update(client, url);
+      }
+    }
+
+    if (result == HTTP_UPDATE_OK) {
+      Serial.printf("[OTA] %s attempt %u/%u result=OK\n", targetName, attempt, cfg::kOtaMaxAttempts);
+      return true;
+    }
+
+    lastErr = ESPhttpUpdate.getLastError();
+    lastErrText = ESPhttpUpdate.getLastErrorString();
+    Serial.printf("[OTA] %s attempt %u/%u failed: code=%d msg=%s\n",
+                  targetName, attempt, cfg::kOtaMaxAttempts, lastErr, lastErrText.c_str());
+
+    if (attempt < cfg::kOtaMaxAttempts) {
+      delay(cfg::kOtaRetryDelayMs);
+      yield();
+    }
   }
 
-  const int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    if (errorMessage) *errorMessage = String("http code: ") + String(code);
-    http.end();
-    return false;
+  if (errorMessage) {
+    *errorMessage = String(lastErr) + ": " + lastErrText + " (attempts=" + String(cfg::kOtaMaxAttempts) + ")";
   }
-
-  const int contentLength = http.getSize();
-  if (contentLength <= 0) {
-    if (errorMessage) *errorMessage = "content length missing";
-    http.end();
-    return false;
-  }
-
-#if defined(U_FS)
-  const int updateCommand = updateFilesystem ? U_FS : U_FLASH;
-#else
-  const int updateCommand = updateFilesystem ? U_SPIFFS : U_FLASH;
-#endif
-
-  if (!Update.begin(static_cast<size_t>(contentLength), updateCommand)) {
-    if (errorMessage) *errorMessage = String(Update.getError());
-    http.end();
-    return false;
-  }
-
-  WiFiClient* stream = http.getStreamPtr();
-  const size_t written = Update.writeStream(*stream);
-  if (written != static_cast<size_t>(contentLength)) {
-    if (errorMessage) *errorMessage = "written bytes mismatch";
-    http.end();
-    return false;
-  }
-
-  if (!Update.end()) {
-    if (errorMessage) *errorMessage = String(Update.getError());
-    http.end();
-    return false;
-  }
-
-  if (!Update.isFinished()) {
-    if (errorMessage) *errorMessage = "update not finished";
-    http.end();
-    return false;
-  }
-
-  http.end();
-  return true;
+  return false;
 }
 
 bool probeGithubTcp(String* errorMessage) {
@@ -578,15 +791,103 @@ bool runOtaUpdate(const String& firmwareUrl, const String& filesystemUrl, bool i
   }
 
   String otaErr;
+  const bool restoreModemSleep = state.wifiModemSleep;
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+
+  bool ok = true;
   if (includeFilesystem && !performHttpOta(filesystemUrl, true, &otaErr)) {
     if (errorMessage) *errorMessage = String("filesystem update failed: ") + otaErr;
-    return false;
+    ok = false;
   }
-  if (!performHttpOta(firmwareUrl, false, &otaErr)) {
+  if (ok && !performHttpOta(firmwareUrl, false, &otaErr)) {
     if (errorMessage) *errorMessage = String("firmware update failed: ") + otaErr;
+    ok = false;
+  }
+
+  WiFi.setSleepMode(restoreModemSleep ? WIFI_MODEM_SLEEP : WIFI_NONE_SLEEP);
+  return ok;
+}
+
+bool queueOtaJob(
+    const String& firmwareUrl,
+    const String& filesystemUrl,
+    bool includeFilesystem,
+    const String& source,
+    const String& tag,
+    String* errorMessage) {
+  if (errorMessage) errorMessage->clear();
+  if (otaJob.pending || otaJob.running || otaJob.rebootScheduled) {
+    if (errorMessage) *errorMessage = "ota already in progress";
     return false;
   }
+  if (firmwareUrl.length() == 0) {
+    if (errorMessage) *errorMessage = "firmware url missing";
+    return false;
+  }
+  if (includeFilesystem && filesystemUrl.length() == 0) {
+    if (errorMessage) *errorMessage = "filesystem url missing";
+    return false;
+  }
+
+  otaJob.pending = true;
+  otaJob.running = false;
+  otaJob.rebootScheduled = false;
+  otaJob.includeFilesystem = includeFilesystem;
+  otaJob.firmwareUrl = firmwareUrl;
+  otaJob.filesystemUrl = filesystemUrl;
+  otaJob.source = source;
+  otaJob.tag = tag;
+  otaJob.phase = "queued";
+  otaJob.lastError = "";
+  otaJob.queuedAtMs = millis();
+  otaJob.startedAtMs = 0;
   return true;
+}
+
+void processOtaJob() {
+  if (!otaJob.pending || otaJob.running || otaJob.rebootScheduled) return;
+  if (millis() - otaJob.queuedAtMs < cfg::kOtaQueueStartDelayMs) return;
+
+  otaJob.pending = false;
+  otaJob.running = true;
+  otaJob.startedAtMs = millis();
+  otaJob.phase = "starting";
+  otaJob.lastError = "";
+
+  // OTA blocks the main loop for a while; stop motion first to avoid leaving active drive.
+  targetPosition = currentLogicalPosition();
+  stepper.moveTo(logicalToRaw(targetPosition));
+  resetTopReferenceWhenStopped = false;
+  disableMotorOutputs();
+  saveState(true);
+
+  Serial.printf(
+      "[OTA] job start source=%s tag=%s includeFS=%u queuedFor=%lus fw=%s fs=%s\n",
+      otaJob.source.c_str(),
+      otaJob.tag.c_str(),
+      static_cast<unsigned>(otaJob.includeFilesystem),
+      static_cast<unsigned long>((millis() - otaJob.queuedAtMs) / 1000),
+      otaJob.firmwareUrl.c_str(),
+      otaJob.filesystemUrl.c_str());
+
+  otaJob.phase = "updating";
+  String err;
+  const bool ok = runOtaUpdate(otaJob.firmwareUrl, otaJob.filesystemUrl, otaJob.includeFilesystem, &err);
+  otaJob.running = false;
+
+  if (!ok) {
+    otaJob.phase = "failed";
+    otaJob.lastError = err;
+    Serial.printf("[OTA] job failed: %s\n", err.c_str());
+    return;
+  }
+
+  otaJob.rebootScheduled = true;
+  otaJob.phase = "completed";
+  otaJob.lastError = "";
+  Serial.println("[OTA] job complete, rebooting");
+  delay(300);
+  ESP.restart();
 }
 
 void handleApiFirmwareUpdateLatest() {
@@ -602,20 +903,20 @@ void handleApiFirmwareUpdateLatest() {
   const String firmwareUrl = "https://github.com/" + firmwareRepo + "/releases/latest/download/" + firmwareAssetName;
   const String filesystemUrl = "https://github.com/" + firmwareRepo + "/releases/latest/download/" + firmwareFsAssetName;
 
-  String err;
-  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
-    sendError(err.c_str(), 502);
+  String queueErr;
+  if (!queueOtaJob(firmwareUrl, filesystemUrl, includeFilesystem, "latest", "", &queueErr)) {
+    sendError(queueErr.c_str(), 409);
     return;
   }
 
   StaticJsonDocument<384> doc;
   doc["ok"] = true;
-  doc["message"] = "ota update complete, rebooting";
+  doc["message"] = "ota job queued";
+  doc["queued"] = true;
+  doc["source"] = "latest";
   doc["firmwareUrl"] = firmwareUrl;
   doc["filesystemUrl"] = filesystemUrl;
-  sendJsonDocument(200, doc);
-  delay(500);
-  ESP.restart();
+  sendJsonDocument(202, doc);
 }
 
 void handleApiFirmwareUpdateRelease() {
@@ -643,21 +944,21 @@ void handleApiFirmwareUpdateRelease() {
   if (firmwareUrl.length() == 0) firmwareUrl = githubReleaseAssetUrl(tag, firmwareAssetName);
   if (filesystemUrl.length() == 0) filesystemUrl = githubReleaseAssetUrl(tag, firmwareFsAssetName);
 
-  String err;
-  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
-    sendError(err.c_str(), 502);
+  String queueErr;
+  if (!queueOtaJob(firmwareUrl, filesystemUrl, includeFilesystem, "release", tag, &queueErr)) {
+    sendError(queueErr.c_str(), 409);
     return;
   }
 
   StaticJsonDocument<448> doc;
   doc["ok"] = true;
-  doc["message"] = "ota release update complete, rebooting";
+  doc["message"] = "ota release job queued";
+  doc["queued"] = true;
+  doc["source"] = "release";
   doc["tag"] = tag;
   doc["firmwareUrl"] = firmwareUrl;
   doc["filesystemUrl"] = filesystemUrl;
-  sendJsonDocument(200, doc);
-  delay(500);
-  ESP.restart();
+  sendJsonDocument(202, doc);
 }
 
 void handleApiFirmwareCheckLatest() {
@@ -714,18 +1015,18 @@ void handleApiFirmwareUpdateUrl() {
   const String filesystemUrl = String(static_cast<const char*>(body["filesystemUrl"] | ""));
   const bool includeFilesystem = body["includeFilesystem"] | true;
 
-  String err;
-  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
-    sendError(err.c_str(), 502);
+  String queueErr;
+  if (!queueOtaJob(firmwareUrl, filesystemUrl, includeFilesystem, "url", "", &queueErr)) {
+    sendError(queueErr.c_str(), 409);
     return;
   }
 
   StaticJsonDocument<384> doc;
   doc["ok"] = true;
-  doc["message"] = "ota update complete, rebooting";
-  sendJsonDocument(200, doc);
-  delay(500);
-  ESP.restart();
+  doc["message"] = "ota url job queued";
+  doc["queued"] = true;
+  doc["source"] = "url";
+  sendJsonDocument(202, doc);
 }
 
 void handleApiWifiReset() {
@@ -824,6 +1125,9 @@ void setup() {
     LittleFS.begin();
   }
 
+  EEPROM.begin(cfg::kEepromSize);
+  eepromReady = true;
+
   loadState();
 
   applyStepperSettings();
@@ -841,6 +1145,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  processOtaJob();
 
   const long rawBefore = stepper.currentPosition();
   const bool wasMoving = stepper.distanceToGo() != 0;
@@ -853,6 +1158,11 @@ void loop() {
 
   if (wasMoving && !isMoving) {
     motionStoppedAtMs = millis();
+    if (resetTopReferenceWhenStopped) {
+      stepper.setCurrentPosition(logicalToRaw(0));
+      stepper.moveTo(logicalToRaw(0));
+      resetTopReferenceWhenStopped = false;
+    }
     targetPosition = currentLogicalPosition();
     saveState(true);
   }

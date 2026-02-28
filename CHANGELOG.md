@@ -2,6 +2,55 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.10] - 2026-02-28
+
+- OTA architecture update for ESP8266 stability:
+  - firmware update endpoints (`latest`, `release`, `url`) now queue OTA jobs and return `202` immediately,
+  - OTA execution moved out of HTTP handler into main loop worker to avoid watchdog resets during HTTPS download.
+- OTA robustness tuning:
+  - retry count increased to `4` attempts,
+  - client timeout increased to `20000` ms,
+  - retry backoff increased to `2500` ms,
+  - queued OTA start delay (`400` ms) added to let HTTP response flush before OTA begins.
+- OTA diagnostics in `/api/state`:
+  - `otaPending`, `otaRunning`, `otaSource`, `otaTag`, `otaPhase`, `otaLastError`, `otaQueuedSec`, `otaRunningSec`.
+
+## [0.1.9] - 2026-02-28
+
+- OTA reliability hardening for ESP8266:
+  - added firmware/filesystem OTA retries (`3` attempts) with short backoff,
+  - added detailed serial diagnostics per OTA attempt (RSSI, heap, URL, result/error),
+  - removed manual watchdog disable/enable around OTA path to avoid watchdog-reset instability.
+- OTA release selector in UI now uses GitHub Releases API (`/releases`) instead of tags (`/tags`), and skips drafts.
+
+## [0.1.8] - 2026-02-28
+
+- Moved persistent controller state to EEPROM (primary), with legacy `/state.json` migration on first boot.
+- Fixed calibration persistence: `set_top`, `set_bottom`, and `reset` now force immediate save.
+- Added hardware regression suite for real device validation:
+  - settings persistence (`reverseDirection`, speeds, hold time),
+  - calibration persistence across reboot and OTA,
+  - OTA repo default fallback and latest URL check.
+- Removed stress-test release padding from firmware/filesystem build configuration.
+
+## [0.1.6] - 2026-02-28
+
+- OTA stress-test build: increased firmware size (`OTA_FW_PAD_BYTES=65536`) and filesystem image (extra `data/ota_pad.bin`).
+
+## [0.1.5] - 2026-02-28
+
+- OTA pipeline switched from manual `Update.writeStream` to `ESP8266httpUpdate` for better stability.
+- Added AGENTS guardrail that OTA reliability is a release blocker and requires repeated hardware verification.
+
+## [0.1.4] - 2026-02-28
+
+- Added configurable top overdrive for `open` command:
+  - `topOverdriveEnabled` (default `true`)
+  - `topOverdrivePercent` (default `10`)
+- Open motion can run beyond logical `0%`, then internal position is re-anchored to `0` after stop.
+- Added calibration tab `Стоп` button.
+- OTA UI now supports selecting a specific GitHub tag and updating to that selected release.
+
 ## [0.1.3] - 2026-02-28
 
 - OTA HTTP client now follows redirects, fixing GitHub `latest/download` update path (`302`).
