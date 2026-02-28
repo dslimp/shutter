@@ -10,6 +10,8 @@
 #include <LittleFS.h>
 #include <EEPROM.h>
 #include <WiFiManager.h>
+#include <time.h>
+#include <math.h>
 #include <memory>
 
 #include "ShutterMath.h"
@@ -25,6 +27,9 @@ constexpr uint16_t kDefaultWifiConnectTimeoutMs = 12000;
 constexpr char kDefaultFirmwareRepo[] = "dslimp/shutter";
 constexpr char kDefaultFirmwareAssetName[] = "firmware.bin";
 constexpr char kDefaultFirmwareFsAssetName[] = "littlefs.bin";
+constexpr char kDefaultTimezone[] = "MSK-3";
+constexpr char kNtpServer1[] = "pool.ntp.org";
+constexpr char kNtpServer2[] = "time.nist.gov";
 constexpr uint8_t kOtaMaxAttempts = 4;
 constexpr uint16_t kOtaClientTimeoutMs = 20000;
 constexpr uint16_t kOtaRetryDelayMs = 2500;
@@ -32,7 +37,7 @@ constexpr uint16_t kOtaQueueStartDelayMs = 400;
 constexpr char kStateFile[] = "/state.json";
 constexpr uint16_t kEepromSize = 512;
 constexpr uint32_t kStateMagic = 0x53485452;  // "SHTR"
-constexpr uint16_t kStateSchemaVersion = 1;
+constexpr uint16_t kStateSchemaVersion = 2;
 constexpr uint32_t kSaveIntervalMs = 5000;
 constexpr long kMinTravelSteps = 100;
 constexpr long kMaxTravelSteps = 300000;
@@ -43,6 +48,12 @@ constexpr float kMaxAccel = 6000.0f;
 constexpr uint16_t kMaxCoilHoldMs = 10000;
 constexpr float kMinTopOverdrivePercent = 0.0f;
 constexpr float kMaxTopOverdrivePercent = 50.0f;
+constexpr float kMinLatitude = -90.0f;
+constexpr float kMaxLatitude = 90.0f;
+constexpr float kMinLongitude = -180.0f;
+constexpr float kMaxLongitude = 180.0f;
+constexpr int16_t kMinScheduleOffsetMinutes = -300;
+constexpr int16_t kMaxScheduleOffsetMinutes = 300;
 
 // 28BYJ-48 + ULN2003 for Wemos ESP-WROOM-02 board
 constexpr uint8_t kPinIn1 = 5;   // GPIO5
@@ -58,13 +69,49 @@ struct ControllerState {
   bool reverseDirection = false;
   bool wifiModemSleep = false;
   bool topOverdriveEnabled = true;
+  bool sunScheduleEnabled = false;
   float maxSpeed = 700.0f;
   float acceleration = 350.0f;
   float topOverdrivePercent = 10.0f;
+  float latitude = 55.7558f;
+  float longitude = 37.6173f;
   uint16_t coilHoldMs = 500;
+  int16_t sunriseOffsetMinutes = 0;
+  int16_t sunsetOffsetMinutes = 0;
+  uint8_t sunriseTargetPercent = 0;
+  uint8_t sunsetTargetPercent = 100;
 };
 
 struct PersistedStateBlob {
+  uint32_t magic;
+  uint16_t schemaVersion;
+  uint16_t structSize;
+  int32_t travelSteps;
+  int32_t currentPosition;
+  uint8_t calibrated;
+  uint8_t reverseDirection;
+  uint8_t wifiModemSleep;
+  uint8_t topOverdriveEnabled;
+  uint8_t sunScheduleEnabled;
+  float maxSpeed;
+  float acceleration;
+  float topOverdrivePercent;
+  float latitude;
+  float longitude;
+  uint16_t coilHoldMs;
+  int16_t sunriseOffsetMinutes;
+  int16_t sunsetOffsetMinutes;
+  uint8_t sunriseTargetPercent;
+  uint8_t sunsetTargetPercent;
+  char timezone[40];
+  char firmwareRepo[64];
+  char firmwareAssetName[32];
+  char firmwareFsAssetName[32];
+  uint32_t checksum;
+};
+
+// Legacy schema v1 used by releases before sun schedule/timezone fields.
+struct PersistedStateBlobV1 {
   uint32_t magic;
   uint16_t schemaVersion;
   uint16_t structSize;
@@ -99,7 +146,20 @@ bool resetTopReferenceWhenStopped = false;
 String firmwareRepo = cfg::kDefaultFirmwareRepo;
 String firmwareAssetName = cfg::kDefaultFirmwareAssetName;
 String firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
+String timezoneSpec = cfg::kDefaultTimezone;
 bool eepromReady = false;
+
+struct SunRuntimeState {
+  bool valid = false;
+  int year = -1;
+  int yday = -1;
+  time_t sunriseEpoch = 0;
+  time_t sunsetEpoch = 0;
+  bool sunriseDone = false;
+  bool sunsetDone = false;
+};
+
+SunRuntimeState sunRuntime;
 
 struct OtaJobState {
   bool pending = false;
@@ -138,6 +198,144 @@ void normalizeFirmwareConfig() {
   if (firmwareFsAssetName.length() == 0) firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
 }
 
+void normalizeTimezoneSpec() {
+  timezoneSpec.trim();
+  if (timezoneSpec.length() == 0) timezoneSpec = cfg::kDefaultTimezone;
+  if (timezoneSpec.length() > 39) timezoneSpec = timezoneSpec.substring(0, 39);
+}
+
+void resetSunRuntime() {
+  sunRuntime.valid = false;
+  sunRuntime.year = -1;
+  sunRuntime.yday = -1;
+  sunRuntime.sunriseEpoch = 0;
+  sunRuntime.sunsetEpoch = 0;
+  sunRuntime.sunriseDone = false;
+  sunRuntime.sunsetDone = false;
+}
+
+void configureTimekeeping() {
+  normalizeTimezoneSpec();
+  configTime(timezoneSpec.c_str(), cfg::kNtpServer1, cfg::kNtpServer2);
+}
+
+bool isClockSynchronized() {
+  return time(nullptr) > 1704067200;  // 2024-01-01 UTC
+}
+
+double normalizeDegrees(double degrees) {
+  while (degrees < 0.0) degrees += 360.0;
+  while (degrees >= 360.0) degrees -= 360.0;
+  return degrees;
+}
+
+double julianDayFromDate(int year, int month, int day) {
+  const int a = (14 - month) / 12;
+  const int y = year + 4800 - a;
+  const int m = month + 12 * a - 3;
+  const int jdn = day + (153 * m + 2) / 5 + 365 * y + y / 4 - y / 100 + y / 400 - 32045;
+  return static_cast<double>(jdn);
+}
+
+time_t julianToUnix(double julianDay) {
+  const double unixSeconds = (julianDay - 2440587.5) * 86400.0;
+  return static_cast<time_t>(llround(unixSeconds));
+}
+
+bool computeSunEventsUtcForDate(
+    int year,
+    int month,
+    int day,
+    float latitude,
+    float longitude,
+    time_t* sunriseEpoch,
+    time_t* sunsetEpoch) {
+  if (!sunriseEpoch || !sunsetEpoch) return false;
+  if (latitude < cfg::kMinLatitude || latitude > cfg::kMaxLatitude) return false;
+  if (longitude < cfg::kMinLongitude || longitude > cfg::kMaxLongitude) return false;
+
+  const double degToRad = 3.14159265358979323846 / 180.0;
+  const double julianDay = julianDayFromDate(year, month, day);
+  // Input longitude is conventional east-positive (e.g. Moscow +37.6).
+  // Sunrise equation here uses west-positive convention, so invert sign.
+  const double westLongitude = -static_cast<double>(longitude);
+  const double n = round(julianDay - 2451545.0009 - westLongitude / 360.0);
+  const double jStar = 2451545.0009 + westLongitude / 360.0 + n;
+
+  const double meanAnomaly = normalizeDegrees(357.5291 + 0.98560028 * (jStar - 2451545.0));
+  const double meanAnomalyRad = meanAnomaly * degToRad;
+  const double center = 1.9148 * sin(meanAnomalyRad) + 0.0200 * sin(2.0 * meanAnomalyRad) + 0.0003 * sin(3.0 * meanAnomalyRad);
+  const double eclipticLongitude = normalizeDegrees(meanAnomaly + center + 180.0 + 102.9372);
+  const double eclipticLongitudeRad = eclipticLongitude * degToRad;
+  const double transit = jStar + 0.0053 * sin(meanAnomalyRad) - 0.0069 * sin(2.0 * eclipticLongitudeRad);
+
+  const double declination = asin(sin(eclipticLongitudeRad) * sin(23.44 * degToRad));
+  const double latitudeRad = static_cast<double>(latitude) * degToRad;
+  const double cosHourAngle =
+      (sin(-0.833 * degToRad) - sin(latitudeRad) * sin(declination)) / (cos(latitudeRad) * cos(declination));
+  if (cosHourAngle < -1.0 || cosHourAngle > 1.0) return false;
+
+  const double hourAngle = acos(cosHourAngle);
+  const double julianSunset = transit + hourAngle / (2.0 * 3.14159265358979323846);
+  const double julianSunrise = transit - hourAngle / (2.0 * 3.14159265358979323846);
+
+  *sunriseEpoch = julianToUnix(julianSunrise);
+  *sunsetEpoch = julianToUnix(julianSunset);
+  return true;
+}
+
+String formatLocalEpoch(time_t epoch) {
+  if (epoch <= 0) return String("-");
+  struct tm info;
+  if (!localtime_r(&epoch, &info)) return String("-");
+  char buffer[24];
+  if (strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &info) == 0) return String("-");
+  return String(buffer);
+}
+
+void refreshSunScheduleForNow(time_t nowEpoch) {
+  if (!state.sunScheduleEnabled || !isClockSynchronized()) {
+    resetSunRuntime();
+    return;
+  }
+
+  struct tm localNow;
+  if (!localtime_r(&nowEpoch, &localNow)) {
+    resetSunRuntime();
+    return;
+  }
+
+  const int year = localNow.tm_year;
+  const int yday = localNow.tm_yday;
+  if (sunRuntime.valid && sunRuntime.year == year && sunRuntime.yday == yday) return;
+
+  time_t sunriseEpoch = 0;
+  time_t sunsetEpoch = 0;
+  const bool ok = computeSunEventsUtcForDate(
+      localNow.tm_year + 1900,
+      localNow.tm_mon + 1,
+      localNow.tm_mday,
+      state.latitude,
+      state.longitude,
+      &sunriseEpoch,
+      &sunsetEpoch);
+  if (!ok) {
+    resetSunRuntime();
+    return;
+  }
+
+  sunriseEpoch += static_cast<time_t>(state.sunriseOffsetMinutes) * 60;
+  sunsetEpoch += static_cast<time_t>(state.sunsetOffsetMinutes) * 60;
+
+  sunRuntime.valid = true;
+  sunRuntime.year = year;
+  sunRuntime.yday = yday;
+  sunRuntime.sunriseEpoch = sunriseEpoch;
+  sunRuntime.sunsetEpoch = sunsetEpoch;
+  sunRuntime.sunriseDone = nowEpoch >= sunriseEpoch;
+  sunRuntime.sunsetDone = nowEpoch >= sunsetEpoch;
+}
+
 uint32_t computeChecksum(const uint8_t* data, size_t length) {
   uint32_t hash = 2166136261UL;
   for (size_t i = 0; i < length; ++i) {
@@ -160,6 +358,7 @@ String parseStringField(const char* src, size_t srcSize) {
 }
 
 void fillPersistedBlob(PersistedStateBlob* blob, long pos) {
+  normalizeTimezoneSpec();
   memset(blob, 0, sizeof(PersistedStateBlob));
   blob->magic = cfg::kStateMagic;
   blob->schemaVersion = cfg::kStateSchemaVersion;
@@ -170,10 +369,18 @@ void fillPersistedBlob(PersistedStateBlob* blob, long pos) {
   blob->reverseDirection = state.reverseDirection ? 1 : 0;
   blob->wifiModemSleep = state.wifiModemSleep ? 1 : 0;
   blob->topOverdriveEnabled = state.topOverdriveEnabled ? 1 : 0;
+  blob->sunScheduleEnabled = state.sunScheduleEnabled ? 1 : 0;
   blob->maxSpeed = state.maxSpeed;
   blob->acceleration = state.acceleration;
   blob->topOverdrivePercent = state.topOverdrivePercent;
+  blob->latitude = state.latitude;
+  blob->longitude = state.longitude;
   blob->coilHoldMs = state.coilHoldMs;
+  blob->sunriseOffsetMinutes = state.sunriseOffsetMinutes;
+  blob->sunsetOffsetMinutes = state.sunsetOffsetMinutes;
+  blob->sunriseTargetPercent = state.sunriseTargetPercent;
+  blob->sunsetTargetPercent = state.sunsetTargetPercent;
+  copyStringField(blob->timezone, sizeof(blob->timezone), timezoneSpec);
   copyStringField(blob->firmwareRepo, sizeof(blob->firmwareRepo), firmwareRepo);
   copyStringField(blob->firmwareAssetName, sizeof(blob->firmwareAssetName), firmwareAssetName);
   copyStringField(blob->firmwareFsAssetName, sizeof(blob->firmwareFsAssetName), firmwareFsAssetName);
@@ -193,6 +400,44 @@ bool applyPersistedBlob(const PersistedStateBlob& blob) {
   state.reverseDirection = blob.reverseDirection != 0;
   state.wifiModemSleep = blob.wifiModemSleep != 0;
   state.topOverdriveEnabled = blob.topOverdriveEnabled != 0;
+  state.sunScheduleEnabled = blob.sunScheduleEnabled != 0;
+  state.maxSpeed = shutter::math::clampFloat(blob.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
+  state.acceleration = shutter::math::clampFloat(blob.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
+  state.topOverdrivePercent =
+      shutter::math::clampFloat(blob.topOverdrivePercent, cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
+  state.latitude = shutter::math::clampFloat(blob.latitude, cfg::kMinLatitude, cfg::kMaxLatitude);
+  state.longitude = shutter::math::clampFloat(blob.longitude, cfg::kMinLongitude, cfg::kMaxLongitude);
+  state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(blob.coilHoldMs, 0, cfg::kMaxCoilHoldMs));
+  state.sunriseOffsetMinutes =
+      static_cast<int16_t>(shutter::math::clampLong(blob.sunriseOffsetMinutes, cfg::kMinScheduleOffsetMinutes, cfg::kMaxScheduleOffsetMinutes));
+  state.sunsetOffsetMinutes =
+      static_cast<int16_t>(shutter::math::clampLong(blob.sunsetOffsetMinutes, cfg::kMinScheduleOffsetMinutes, cfg::kMaxScheduleOffsetMinutes));
+  state.sunriseTargetPercent = static_cast<uint8_t>(shutter::math::clampLong(blob.sunriseTargetPercent, 0, 100));
+  state.sunsetTargetPercent = static_cast<uint8_t>(shutter::math::clampLong(blob.sunsetTargetPercent, 0, 100));
+  timezoneSpec = parseStringField(blob.timezone, sizeof(blob.timezone));
+  firmwareRepo = parseStringField(blob.firmwareRepo, sizeof(blob.firmwareRepo));
+  firmwareAssetName = parseStringField(blob.firmwareAssetName, sizeof(blob.firmwareAssetName));
+  firmwareFsAssetName = parseStringField(blob.firmwareFsAssetName, sizeof(blob.firmwareFsAssetName));
+  normalizeTimezoneSpec();
+  normalizeFirmwareConfig();
+  resetSunRuntime();
+  return true;
+}
+
+bool applyPersistedBlobV1(const PersistedStateBlobV1& blob) {
+  if (blob.magic != cfg::kStateMagic) return false;
+  if (blob.schemaVersion != 1) return false;
+  if (blob.structSize != sizeof(PersistedStateBlobV1)) return false;
+  const uint32_t expected =
+      computeChecksum(reinterpret_cast<const uint8_t*>(&blob), sizeof(PersistedStateBlobV1) - sizeof(uint32_t));
+  if (blob.checksum != expected) return false;
+
+  state.travelSteps = shutter::math::clampLong(blob.travelSteps, cfg::kMinTravelSteps, cfg::kMaxTravelSteps);
+  state.currentPosition = shutter::math::clampLong(blob.currentPosition, 0, state.travelSteps);
+  state.calibrated = blob.calibrated != 0;
+  state.reverseDirection = blob.reverseDirection != 0;
+  state.wifiModemSleep = blob.wifiModemSleep != 0;
+  state.topOverdriveEnabled = blob.topOverdriveEnabled != 0;
   state.maxSpeed = shutter::math::clampFloat(blob.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
   state.acceleration = shutter::math::clampFloat(blob.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
   state.topOverdrivePercent =
@@ -202,6 +447,8 @@ bool applyPersistedBlob(const PersistedStateBlob& blob) {
   firmwareAssetName = parseStringField(blob.firmwareAssetName, sizeof(blob.firmwareAssetName));
   firmwareFsAssetName = parseStringField(blob.firmwareFsAssetName, sizeof(blob.firmwareFsAssetName));
   normalizeFirmwareConfig();
+  normalizeTimezoneSpec();
+  resetSunRuntime();
   return true;
 }
 
@@ -258,6 +505,13 @@ void fillStateJson(JsonObject root) {
   const long tgt = clampLogicalPosition(targetPosition);
   const bool moving = stepper.distanceToGo() != 0;
   const uint32_t nowMs = millis();
+  const time_t nowEpoch = time(nullptr);
+  const bool timeSynced = isClockSynchronized();
+  if (timeSynced) {
+    refreshSunScheduleForNow(nowEpoch);
+  } else {
+    resetSunRuntime();
+  }
   uint32_t adcSum = 0;
   for (uint8_t i = 0; i < 8; ++i) {
     adcSum += analogRead(A0);
@@ -281,6 +535,12 @@ void fillStateJson(JsonObject root) {
   root["rssi"] = WiFi.RSSI();
   root["a0Raw"] = a0Raw;
   root["uptimeSec"] = millis() / 1000;
+  root["unixTime"] = static_cast<int64_t>(nowEpoch);
+  root["timeSynced"] = timeSynced;
+  root["localTime"] = timeSynced ? formatLocalEpoch(nowEpoch) : String("-");
+  root["timezone"] = timezoneSpec;
+  root["ntpServer1"] = cfg::kNtpServer1;
+  root["ntpServer2"] = cfg::kNtpServer2;
   root["motion"] = motion;
   root["moving"] = moving;
   root["calibrated"] = state.calibrated;
@@ -293,6 +553,20 @@ void fillStateJson(JsonObject root) {
   root["wifiModemSleep"] = state.wifiModemSleep;
   root["topOverdriveEnabled"] = state.topOverdriveEnabled;
   root["topOverdrivePercent"] = state.topOverdrivePercent;
+  root["sunScheduleEnabled"] = state.sunScheduleEnabled;
+  root["latitude"] = state.latitude;
+  root["longitude"] = state.longitude;
+  root["sunriseOffsetMinutes"] = state.sunriseOffsetMinutes;
+  root["sunsetOffsetMinutes"] = state.sunsetOffsetMinutes;
+  root["sunriseTargetPercent"] = state.sunriseTargetPercent;
+  root["sunsetTargetPercent"] = state.sunsetTargetPercent;
+  root["sunScheduleReady"] = sunRuntime.valid;
+  root["sunriseEpoch"] = static_cast<int64_t>(sunRuntime.sunriseEpoch);
+  root["sunsetEpoch"] = static_cast<int64_t>(sunRuntime.sunsetEpoch);
+  root["sunriseTime"] = sunRuntime.valid ? formatLocalEpoch(sunRuntime.sunriseEpoch) : String("-");
+  root["sunsetTime"] = sunRuntime.valid ? formatLocalEpoch(sunRuntime.sunsetEpoch) : String("-");
+  root["sunriseDoneToday"] = sunRuntime.sunriseDone;
+  root["sunsetDoneToday"] = sunRuntime.sunsetDone;
   root["maxSpeed"] = state.maxSpeed;
   root["acceleration"] = state.acceleration;
   root["coilHoldMs"] = state.coilHoldMs;
@@ -327,23 +601,42 @@ bool loadStateFromLegacyFs() {
   state.reverseDirection = doc["reverseDirection"] | state.reverseDirection;
   state.wifiModemSleep = doc["wifiModemSleep"] | state.wifiModemSleep;
   state.topOverdriveEnabled = doc["topOverdriveEnabled"] | state.topOverdriveEnabled;
+  state.sunScheduleEnabled = doc["sunScheduleEnabled"] | state.sunScheduleEnabled;
   state.maxSpeed = shutter::math::clampFloat(doc["maxSpeed"] | state.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
   state.acceleration = shutter::math::clampFloat(doc["acceleration"] | state.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
   state.topOverdrivePercent = shutter::math::clampFloat(
       doc["topOverdrivePercent"] | state.topOverdrivePercent, cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
+  state.latitude = shutter::math::clampFloat(doc["latitude"] | state.latitude, cfg::kMinLatitude, cfg::kMaxLatitude);
+  state.longitude = shutter::math::clampFloat(doc["longitude"] | state.longitude, cfg::kMinLongitude, cfg::kMaxLongitude);
   state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(doc["coilHoldMs"] | state.coilHoldMs, 0, cfg::kMaxCoilHoldMs));
+  state.sunriseOffsetMinutes = static_cast<int16_t>(shutter::math::clampLong(
+      doc["sunriseOffsetMinutes"] | state.sunriseOffsetMinutes, cfg::kMinScheduleOffsetMinutes, cfg::kMaxScheduleOffsetMinutes));
+  state.sunsetOffsetMinutes = static_cast<int16_t>(shutter::math::clampLong(
+      doc["sunsetOffsetMinutes"] | state.sunsetOffsetMinutes, cfg::kMinScheduleOffsetMinutes, cfg::kMaxScheduleOffsetMinutes));
+  state.sunriseTargetPercent = static_cast<uint8_t>(shutter::math::clampLong(doc["sunriseTargetPercent"] | state.sunriseTargetPercent, 0, 100));
+  state.sunsetTargetPercent = static_cast<uint8_t>(shutter::math::clampLong(doc["sunsetTargetPercent"] | state.sunsetTargetPercent, 0, 100));
+  timezoneSpec = String(static_cast<const char*>(doc["timezone"] | timezoneSpec.c_str()));
   firmwareRepo = String(static_cast<const char*>(doc["firmwareRepo"] | firmwareRepo.c_str()));
   firmwareAssetName = String(static_cast<const char*>(doc["firmwareAssetName"] | firmwareAssetName.c_str()));
   firmwareFsAssetName = String(static_cast<const char*>(doc["firmwareFsAssetName"] | firmwareFsAssetName.c_str()));
+  normalizeTimezoneSpec();
   normalizeFirmwareConfig();
+  resetSunRuntime();
   return true;
 }
 
-bool loadStateFromEeprom() {
+bool loadStateFromEeprom(bool* migratedToCurrent = nullptr) {
+  if (migratedToCurrent) *migratedToCurrent = false;
   if (!eepromReady) return false;
   PersistedStateBlob blob;
   EEPROM.get(0, blob);
-  return applyPersistedBlob(blob);
+  if (applyPersistedBlob(blob)) return true;
+
+  PersistedStateBlobV1 legacyBlob;
+  EEPROM.get(0, legacyBlob);
+  if (!applyPersistedBlobV1(legacyBlob)) return false;
+  if (migratedToCurrent) *migratedToCurrent = true;
+  return true;
 }
 
 bool saveStateToEeprom(long pos) {
@@ -362,10 +655,18 @@ bool saveStateToLegacyFs(long pos) {
   doc["reverseDirection"] = state.reverseDirection;
   doc["wifiModemSleep"] = state.wifiModemSleep;
   doc["topOverdriveEnabled"] = state.topOverdriveEnabled;
+  doc["sunScheduleEnabled"] = state.sunScheduleEnabled;
   doc["maxSpeed"] = state.maxSpeed;
   doc["acceleration"] = state.acceleration;
   doc["topOverdrivePercent"] = state.topOverdrivePercent;
+  doc["latitude"] = state.latitude;
+  doc["longitude"] = state.longitude;
   doc["coilHoldMs"] = state.coilHoldMs;
+  doc["sunriseOffsetMinutes"] = state.sunriseOffsetMinutes;
+  doc["sunsetOffsetMinutes"] = state.sunsetOffsetMinutes;
+  doc["sunriseTargetPercent"] = state.sunriseTargetPercent;
+  doc["sunsetTargetPercent"] = state.sunsetTargetPercent;
+  doc["timezone"] = timezoneSpec;
   doc["firmwareRepo"] = firmwareRepo;
   doc["firmwareAssetName"] = firmwareAssetName;
   doc["firmwareFsAssetName"] = firmwareFsAssetName;
@@ -381,7 +682,18 @@ bool saveStateToLegacyFs(long pos) {
 }
 
 bool loadState() {
-  if (loadStateFromEeprom()) return true;
+  bool migratedToCurrent = false;
+  if (loadStateFromEeprom(&migratedToCurrent)) {
+    if (migratedToCurrent) {
+      const long pos = shutter::math::clampLong(state.currentPosition, 0, state.travelSteps);
+      saveStateToEeprom(pos);
+      saveStateToLegacyFs(pos);
+      lastSavedPosition = pos;
+      lastSaveMs = millis();
+      settingsDirty = false;
+    }
+    return true;
+  }
   if (!loadStateFromLegacyFs()) return false;
   const long pos = shutter::math::clampLong(state.currentPosition, 0, state.travelSteps);
   saveStateToEeprom(pos);
@@ -451,6 +763,38 @@ void startOpenMotion() {
   setTargetRawWithLogical(rawTarget, 0);
 }
 
+void setTargetByPercent(uint8_t percentValue) {
+  const float percent = shutter::math::clampFloat(static_cast<float>(percentValue), 0.0f, 100.0f);
+  if (percent <= 0.0f) {
+    startOpenMotion();
+    return;
+  }
+  const long target = shutter::math::percentToSteps(percent, state.travelSteps);
+  setTargetPosition(target);
+}
+
+void processSunSchedule() {
+  if (!state.sunScheduleEnabled || !state.calibrated) return;
+  if (otaJob.pending || otaJob.running || otaJob.rebootScheduled) return;
+  if (!isClockSynchronized()) return;
+
+  const time_t nowEpoch = time(nullptr);
+  refreshSunScheduleForNow(nowEpoch);
+  if (!sunRuntime.valid) return;
+
+  if (!sunRuntime.sunriseDone && nowEpoch >= sunRuntime.sunriseEpoch) {
+    sunRuntime.sunriseDone = true;
+    Serial.printf("[SUN] sunrise trigger: target=%u%%\n", static_cast<unsigned>(state.sunriseTargetPercent));
+    setTargetByPercent(state.sunriseTargetPercent);
+  }
+
+  if (!sunRuntime.sunsetDone && nowEpoch >= sunRuntime.sunsetEpoch) {
+    sunRuntime.sunsetDone = true;
+    Serial.printf("[SUN] sunset trigger: target=%u%%\n", static_cast<unsigned>(state.sunsetTargetPercent));
+    setTargetByPercent(state.sunsetTargetPercent);
+  }
+}
+
 void stopMotor() {
   resetTopReferenceWhenStopped = false;
   const long rawNow = stepper.currentPosition();
@@ -499,7 +843,9 @@ void calibrateJog(long logicalDelta) {
 }
 
 void handleApiState() {
-  StaticJsonDocument<1024> doc;
+  // Keep state payload document in static storage to avoid large per-request stack usage.
+  static StaticJsonDocument<2304> doc;
+  doc.clear();
   fillStateJson(doc.to<JsonObject>());
   sendJsonDocument(200, doc);
 }
@@ -585,7 +931,7 @@ void handleApiCalibrate() {
 }
 
 void handleApiSettings() {
-  StaticJsonDocument<512> body;
+  StaticJsonDocument<768> body;
   if (!parseJsonBody(body)) {
     sendError("invalid json");
     return;
@@ -593,6 +939,8 @@ void handleApiSettings() {
 
   const long logicalPosBefore = currentLogicalPosition();
   const long logicalTargetBefore = targetPosition;
+  const String oldTimezoneSpec = timezoneSpec;
+  bool scheduleConfigChanged = false;
 
   if (body.containsKey("reverseDirection")) {
     state.reverseDirection = body["reverseDirection"].as<bool>();
@@ -602,6 +950,10 @@ void handleApiSettings() {
   }
   if (body.containsKey("topOverdriveEnabled")) {
     state.topOverdriveEnabled = body["topOverdriveEnabled"].as<bool>();
+  }
+  if (body.containsKey("sunScheduleEnabled")) {
+    state.sunScheduleEnabled = body["sunScheduleEnabled"].as<bool>();
+    scheduleConfigChanged = true;
   }
   if (body.containsKey("maxSpeed")) {
     state.maxSpeed = shutter::math::clampFloat(body["maxSpeed"].as<float>(), cfg::kMinSpeed, cfg::kMaxSpeed);
@@ -613,11 +965,49 @@ void handleApiSettings() {
     state.topOverdrivePercent =
         shutter::math::clampFloat(body["topOverdrivePercent"].as<float>(), cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
   }
+  if (body.containsKey("latitude")) {
+    state.latitude = shutter::math::clampFloat(body["latitude"].as<float>(), cfg::kMinLatitude, cfg::kMaxLatitude);
+    scheduleConfigChanged = true;
+  }
+  if (body.containsKey("longitude")) {
+    state.longitude = shutter::math::clampFloat(body["longitude"].as<float>(), cfg::kMinLongitude, cfg::kMaxLongitude);
+    scheduleConfigChanged = true;
+  }
   if (body.containsKey("coilHoldMs")) {
     state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(body["coilHoldMs"].as<long>(), 0, cfg::kMaxCoilHoldMs));
   }
+  if (body.containsKey("sunriseOffsetMinutes")) {
+    state.sunriseOffsetMinutes = static_cast<int16_t>(shutter::math::clampLong(
+        body["sunriseOffsetMinutes"].as<long>(), cfg::kMinScheduleOffsetMinutes, cfg::kMaxScheduleOffsetMinutes));
+    scheduleConfigChanged = true;
+  }
+  if (body.containsKey("sunsetOffsetMinutes")) {
+    state.sunsetOffsetMinutes = static_cast<int16_t>(shutter::math::clampLong(
+        body["sunsetOffsetMinutes"].as<long>(), cfg::kMinScheduleOffsetMinutes, cfg::kMaxScheduleOffsetMinutes));
+    scheduleConfigChanged = true;
+  }
+  if (body.containsKey("sunriseTargetPercent")) {
+    state.sunriseTargetPercent = static_cast<uint8_t>(shutter::math::clampLong(body["sunriseTargetPercent"].as<long>(), 0, 100));
+    scheduleConfigChanged = true;
+  }
+  if (body.containsKey("sunsetTargetPercent")) {
+    state.sunsetTargetPercent = static_cast<uint8_t>(shutter::math::clampLong(body["sunsetTargetPercent"].as<long>(), 0, 100));
+    scheduleConfigChanged = true;
+  }
   if (body.containsKey("travelSteps")) {
     state.travelSteps = shutter::math::clampLong(body["travelSteps"].as<long>(), cfg::kMinTravelSteps, cfg::kMaxTravelSteps);
+  }
+  if (body.containsKey("timezone")) {
+    timezoneSpec = String(static_cast<const char*>(body["timezone"] | timezoneSpec.c_str()));
+    normalizeTimezoneSpec();
+  }
+
+  if (timezoneSpec != oldTimezoneSpec) {
+    configureTimekeeping();
+    scheduleConfigChanged = true;
+  }
+  if (scheduleConfigChanged) {
+    resetSunRuntime();
   }
 
   applyStepperSettings();
@@ -1138,6 +1528,7 @@ void setup() {
   disableMotorOutputs();
 
   setupWiFi();
+  configureTimekeeping();
   setupWebServer();
 
   saveState(true);
@@ -1146,6 +1537,7 @@ void setup() {
 void loop() {
   server.handleClient();
   processOtaJob();
+  processSunSchedule();
 
   const long rawBefore = stepper.currentPosition();
   const bool wasMoving = stepper.distanceToGo() != 0;

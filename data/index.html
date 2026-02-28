@@ -119,6 +119,10 @@
             <input id="topOverdriveEnabled" type="checkbox">
             <label for="topOverdriveEnabled">Довод открытия выше 0%</label>
           </div>
+          <div class="toggle">
+            <input id="sunScheduleEnabled" type="checkbox">
+            <label for="sunScheduleEnabled">Авто по рассвету/закату</label>
+          </div>
         </div>
 
         <div class="row">
@@ -143,6 +147,48 @@
             <input id="topOverdrivePercent" type="number" min="0" max="50" step="1" value="10">
           </div>
         </div>
+
+        <h3>Время и расписание</h3>
+        <div class="row">
+          <div class="field">
+            <label for="timezone">Часовой пояс (TZ)</label>
+            <input id="timezone" type="text" placeholder="MSK-3">
+          </div>
+          <div class="field">
+            <label for="latitude">Широта</label>
+            <input id="latitude" type="number" min="-90" max="90" step="0.0001">
+          </div>
+          <div class="field">
+            <label for="longitude">Долгота</label>
+            <input id="longitude" type="number" min="-180" max="180" step="0.0001">
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="sunriseOffsetMinutes">Смещение рассвета, мин</label>
+            <input id="sunriseOffsetMinutes" type="number" min="-300" max="300" step="1" value="0">
+          </div>
+          <div class="field">
+            <label for="sunriseTargetPercent">Позиция на рассвете, %</label>
+            <input id="sunriseTargetPercent" type="number" min="0" max="100" step="1" value="0">
+          </div>
+          <div class="field">
+            <label for="sunsetOffsetMinutes">Смещение заката, мин</label>
+            <input id="sunsetOffsetMinutes" type="number" min="-300" max="300" step="1" value="0">
+          </div>
+          <div class="field">
+            <label for="sunsetTargetPercent">Позиция на закате, %</label>
+            <input id="sunsetTargetPercent" type="number" min="0" max="100" step="1" value="100">
+          </div>
+        </div>
+
+        <p class="help">
+          Локальное время: <b id="localTimeView">-</b> |
+          NTP: <b id="timeSyncView">-</b><br>
+          Рассвет: <b id="sunriseView">-</b> (<span id="sunriseDoneView">-</span>) |
+          Закат: <b id="sunsetView">-</b> (<span id="sunsetDoneView">-</span>)
+        </p>
 
         <div class="row">
           <button class="btn" onclick="saveSettings()">Сохранить настройки</button>

@@ -41,8 +41,26 @@
   - `POST /api/wifi/reset`
   - `GET/POST /api/firmware/config`
   - `POST /api/firmware/update/latest`
+  - `POST /api/firmware/update/release`
   - `POST /api/firmware/update/url`
 - Do not reintroduce peristaltic pump endpoints (`/api/flow`, `/api/dosing`, etc.) in this repo.
+
+## Timekeeping & Sun Schedule
+
+- Time source: NTP via `configTime` (default servers: `pool.ntp.org`, `time.nist.gov`).
+- Timezone is configurable via POSIX TZ string in settings (`timezone`), default `MSK-3`.
+- Autonomous shutter schedule fields in `POST /api/settings`:
+  - `sunScheduleEnabled` (bool)
+  - `latitude`, `longitude` (float)
+  - `sunriseOffsetMinutes`, `sunsetOffsetMinutes` (int, minutes)
+  - `sunriseTargetPercent`, `sunsetTargetPercent` (0..100)
+- Runtime status in `GET /api/state` includes:
+  - `timeSynced`, `localTime`, `timezone`
+  - `sunScheduleReady`, `sunriseTime`, `sunsetTime`
+  - `sunriseDoneToday`, `sunsetDoneToday`
+- Scheduler constraints:
+  - runs only when calibrated (`calibrated=true`), schedule enabled, and time synchronized.
+  - does not run while OTA job is pending/running.
 
 ## Calibration Model
 
@@ -52,6 +70,12 @@
   - `set_bottom` -> logical 100%
 - Persist calibration/settings/current position in `EEPROM` (primary storage).
 - Keep `/state.json` only as legacy migration source for old firmware.
+- EEPROM migration policy (mandatory for every future firmware release):
+  - Do not reorder or delete fields in existing persisted blob structs.
+  - When schema changes, add explicit legacy struct + migrator (`applyPersistedBlobV<N>`).
+  - In loader, try current schema first, then legacy schemas in descending order.
+  - After successful legacy load, immediately rewrite EEPROM in current schema (one-time migration).
+  - A release is not complete until migration path is verified on hardware from at least one previous schema.
 
 ## Validation Workflow
 
@@ -61,7 +85,22 @@
 - Hardware regression suite (mandatory before release/OTA changes): `bash scripts/hw_regression_suite.sh 192.168.88.74`
 - Upload firmware: `pio run -t upload`
 - Upload filesystem: `pio run -t uploadfs`
+- OTA from public URLs (if no serial): `POST /api/firmware/update/url` with both `firmwareUrl` and `filesystemUrl`
 - Serial monitor: `pio device monitor -b 115200`
+
+## Device Flashing Guide
+
+- Full serial flashing (recommended for recovery/bootstrap):
+  1) Build: `pio run -e wroom_02`
+  2) Flash firmware: `pio run -e wroom_02 -t upload --upload-port /dev/cu.usbserial-0001`
+  3) Flash filesystem: `pio run -e wroom_02 -t uploadfs --upload-port /dev/cu.usbserial-0001`
+  4) Verify version: `curl -sS http://192.168.88.74/api/state`
+- UART monitoring notes:
+  - Boot ROM logs are `74880`, runtime logs are `115200`.
+  - Visible "noise" right after reset is expected when monitor baud does not match the current boot/runtime phase.
+- OTA bootstrap rule:
+  - Safe OTA baseline is `v0.1.10`.
+  - If a device is on legacy firmware with unstable GitHub OTA path, first move it to `0.1.10` via serial flash or `POST /api/firmware/update/url`, then continue regular GitHub OTA.
 
 ## Flash Port
 

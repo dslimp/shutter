@@ -84,16 +84,30 @@ function renderState(state) {
   document.getElementById('targetPercentView').textContent = `${targetPercent.toFixed(1)}%`;
   document.getElementById('stepsView').textContent = `${state.positionSteps} / ${state.travelSteps}`;
   document.getElementById('ipView').textContent = state.ip || '-';
+  document.getElementById('localTimeView').textContent = state.localTime || '-';
+  document.getElementById('timeSyncView').textContent = state.timeSynced ? 'ok' : 'нет';
+  document.getElementById('sunriseView').textContent = state.sunriseTime || '-';
+  document.getElementById('sunsetView').textContent = state.sunsetTime || '-';
+  document.getElementById('sunriseDoneView').textContent = state.sunriseDoneToday ? 'выполнено' : 'ожидание';
+  document.getElementById('sunsetDoneView').textContent = state.sunsetDoneToday ? 'выполнено' : 'ожидание';
   document.getElementById('rawState').textContent = JSON.stringify(state, null, 2);
 
   setInputValue('travelSteps', state.travelSteps);
   setInputValue('maxSpeed', Number(state.maxSpeed || 0).toFixed(0));
   setInputValue('acceleration', Number(state.acceleration || 0).toFixed(0));
   setInputValue('coilHoldMs', state.coilHoldMs);
+  setInputValue('latitude', Number(state.latitude ?? 0).toFixed(4));
+  setInputValue('longitude', Number(state.longitude ?? 0).toFixed(4));
+  setInputValue('sunriseOffsetMinutes', state.sunriseOffsetMinutes ?? 0);
+  setInputValue('sunsetOffsetMinutes', state.sunsetOffsetMinutes ?? 0);
+  setInputValue('sunriseTargetPercent', state.sunriseTargetPercent ?? 0);
+  setInputValue('sunsetTargetPercent', state.sunsetTargetPercent ?? 100);
   setCheckboxValue('reverseDirection', state.reverseDirection);
   setCheckboxValue('wifiModemSleep', state.wifiModemSleep);
   setCheckboxValue('topOverdriveEnabled', state.topOverdriveEnabled);
+  setCheckboxValue('sunScheduleEnabled', state.sunScheduleEnabled);
   setInputValue('topOverdrivePercent', Number(state.topOverdrivePercent ?? 10).toFixed(0));
+  setTextValue('timezone', state.timezone || '');
   setTextValue('fwRepo', state.firmwareRepo || '');
   setTextValue('fwAssetName', state.firmwareAssetName || 'firmware.bin');
   setTextValue('fwFsAssetName', state.firmwareFsAssetName || 'littlefs.bin');
@@ -221,11 +235,19 @@ async function saveSettings() {
     reverseDirection: document.getElementById('reverseDirection').checked,
     wifiModemSleep: document.getElementById('wifiModemSleep').checked,
     topOverdriveEnabled: document.getElementById('topOverdriveEnabled').checked,
+    sunScheduleEnabled: document.getElementById('sunScheduleEnabled').checked,
     travelSteps: Number(document.getElementById('travelSteps').value),
     maxSpeed: Number(document.getElementById('maxSpeed').value),
     acceleration: Number(document.getElementById('acceleration').value),
     coilHoldMs: Number(document.getElementById('coilHoldMs').value),
     topOverdrivePercent: Number(document.getElementById('topOverdrivePercent').value),
+    timezone: document.getElementById('timezone').value.trim(),
+    latitude: Number(document.getElementById('latitude').value),
+    longitude: Number(document.getElementById('longitude').value),
+    sunriseOffsetMinutes: Number(document.getElementById('sunriseOffsetMinutes').value),
+    sunsetOffsetMinutes: Number(document.getElementById('sunsetOffsetMinutes').value),
+    sunriseTargetPercent: Number(document.getElementById('sunriseTargetPercent').value),
+    sunsetTargetPercent: Number(document.getElementById('sunsetTargetPercent').value),
   };
 
   try {
@@ -404,7 +426,7 @@ async function updateFirmwareFromUrl() {
 
 showTab('control');
 
-['travelSteps', 'maxSpeed', 'acceleration', 'coilHoldMs', 'topOverdrivePercent', 'reverseDirection', 'wifiModemSleep', 'topOverdriveEnabled'].forEach((id) => {
+['travelSteps', 'maxSpeed', 'acceleration', 'coilHoldMs', 'topOverdrivePercent', 'reverseDirection', 'wifiModemSleep', 'topOverdriveEnabled', 'sunScheduleEnabled', 'timezone', 'latitude', 'longitude', 'sunriseOffsetMinutes', 'sunsetOffsetMinutes', 'sunriseTargetPercent', 'sunsetTargetPercent'].forEach((id) => {
   const el = document.getElementById(id);
   if (!el) return;
   el.addEventListener('input', () => { settingsDirty = true; });
