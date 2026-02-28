@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.4] - 2026-02-28
+
+- Added configurable top overdrive for `open` command:
+  - `topOverdriveEnabled` (default `true`)
+  - `topOverdrivePercent` (default `10`)
+- Open motion can run beyond logical `0%`, then internal position is re-anchored to `0` after stop.
+- Added calibration tab `Стоп` button.
+- OTA UI now supports selecting a specific GitHub tag and updating to that selected release.
+
 ## [0.1.3] - 2026-02-28
 
 - OTA HTTP client now follows redirects, fixing GitHub `latest/download` update path (`302`).

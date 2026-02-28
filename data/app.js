@@ -92,6 +92,8 @@ function renderState(state) {
   setInputValue('coilHoldMs', state.coilHoldMs);
   setCheckboxValue('reverseDirection', state.reverseDirection);
   setCheckboxValue('wifiModemSleep', state.wifiModemSleep);
+  setCheckboxValue('topOverdriveEnabled', state.topOverdriveEnabled);
+  setInputValue('topOverdrivePercent', Number(state.topOverdrivePercent ?? 10).toFixed(0));
   setTextValue('fwRepo', state.firmwareRepo || '');
   setTextValue('fwAssetName', state.firmwareAssetName || 'firmware.bin');
   setTextValue('fwFsAssetName', state.firmwareFsAssetName || 'littlefs.bin');
@@ -218,10 +220,12 @@ async function saveSettings() {
   const payload = {
     reverseDirection: document.getElementById('reverseDirection').checked,
     wifiModemSleep: document.getElementById('wifiModemSleep').checked,
+    topOverdriveEnabled: document.getElementById('topOverdriveEnabled').checked,
     travelSteps: Number(document.getElementById('travelSteps').value),
     maxSpeed: Number(document.getElementById('maxSpeed').value),
     acceleration: Number(document.getElementById('acceleration').value),
     coilHoldMs: Number(document.getElementById('coilHoldMs').value),
+    topOverdrivePercent: Number(document.getElementById('topOverdrivePercent').value),
   };
 
   try {
@@ -399,7 +403,7 @@ async function updateFirmwareFromUrl() {
 
 showTab('control');
 
-['travelSteps', 'maxSpeed', 'acceleration', 'coilHoldMs', 'reverseDirection', 'wifiModemSleep'].forEach((id) => {
+['travelSteps', 'maxSpeed', 'acceleration', 'coilHoldMs', 'topOverdrivePercent', 'reverseDirection', 'wifiModemSleep', 'topOverdriveEnabled'].forEach((id) => {
   const el = document.getElementById(id);
   if (!el) return;
   el.addEventListener('input', () => { settingsDirty = true; });

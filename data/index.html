@@ -115,6 +115,10 @@
             <input id="wifiModemSleep" type="checkbox">
             <label for="wifiModemSleep">Wi-Fi modem sleep (экономия батареи)</label>
           </div>
+          <div class="toggle">
+            <input id="topOverdriveEnabled" type="checkbox">
+            <label for="topOverdriveEnabled">Довод открытия выше 0%</label>
+          </div>
         </div>
 
         <div class="row">
@@ -133,6 +137,10 @@
           <div class="field">
             <label for="coilHoldMs">Удержание обмоток после стопа (мс)</label>
             <input id="coilHoldMs" type="number" min="0" max="10000" step="50">
+          </div>
+          <div class="field">
+            <label for="topOverdrivePercent">Довод открытия, % хода</label>
+            <input id="topOverdrivePercent" type="number" min="0" max="50" step="1" value="10">
           </div>
         </div>
 

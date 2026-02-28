@@ -13,7 +13,7 @@
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.3-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.4-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
@@ -32,6 +32,8 @@ constexpr float kMaxSpeed = 2500.0f;
 constexpr float kMinAccel = 40.0f;
 constexpr float kMaxAccel = 6000.0f;
 constexpr uint16_t kMaxCoilHoldMs = 10000;
+constexpr float kMinTopOverdrivePercent = 0.0f;
+constexpr float kMaxTopOverdrivePercent = 50.0f;
 
 // 28BYJ-48 + ULN2003 for Wemos ESP-WROOM-02 board
 constexpr uint8_t kPinIn1 = 5;   // GPIO5
@@ -46,8 +48,10 @@ struct ControllerState {
   bool calibrated = false;
   bool reverseDirection = false;
   bool wifiModemSleep = false;
+  bool topOverdriveEnabled = true;
   float maxSpeed = 700.0f;
   float acceleration = 350.0f;
+  float topOverdrivePercent = 10.0f;
   uint16_t coilHoldMs = 500;
 };
 
@@ -62,6 +66,7 @@ bool outputsReleased = false;
 long lastSavedPosition = -1;
 uint32_t lastSaveMs = 0;
 uint32_t motionStoppedAtMs = 0;
+bool resetTopReferenceWhenStopped = false;
 String firmwareRepo = cfg::kDefaultFirmwareRepo;
 String firmwareAssetName = cfg::kDefaultFirmwareAssetName;
 String firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
@@ -167,6 +172,8 @@ void fillStateJson(JsonObject root) {
   root["targetPercent"] = tgtPercent;
   root["reverseDirection"] = state.reverseDirection;
   root["wifiModemSleep"] = state.wifiModemSleep;
+  root["topOverdriveEnabled"] = state.topOverdriveEnabled;
+  root["topOverdrivePercent"] = state.topOverdrivePercent;
   root["maxSpeed"] = state.maxSpeed;
   root["acceleration"] = state.acceleration;
   root["coilHoldMs"] = state.coilHoldMs;
@@ -192,8 +199,11 @@ bool loadState() {
   state.calibrated = doc["calibrated"] | state.calibrated;
   state.reverseDirection = doc["reverseDirection"] | state.reverseDirection;
   state.wifiModemSleep = doc["wifiModemSleep"] | state.wifiModemSleep;
+  state.topOverdriveEnabled = doc["topOverdriveEnabled"] | state.topOverdriveEnabled;
   state.maxSpeed = shutter::math::clampFloat(doc["maxSpeed"] | state.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
   state.acceleration = shutter::math::clampFloat(doc["acceleration"] | state.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
+  state.topOverdrivePercent = shutter::math::clampFloat(
+      doc["topOverdrivePercent"] | state.topOverdrivePercent, cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
   state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(doc["coilHoldMs"] | state.coilHoldMs, 0, cfg::kMaxCoilHoldMs));
   firmwareRepo = String(static_cast<const char*>(doc["firmwareRepo"] | firmwareRepo.c_str()));
   firmwareAssetName = String(static_cast<const char*>(doc["firmwareAssetName"] | firmwareAssetName.c_str()));
@@ -217,8 +227,10 @@ bool saveState(bool force = false) {
   doc["calibrated"] = state.calibrated;
   doc["reverseDirection"] = state.reverseDirection;
   doc["wifiModemSleep"] = state.wifiModemSleep;
+  doc["topOverdriveEnabled"] = state.topOverdriveEnabled;
   doc["maxSpeed"] = state.maxSpeed;
   doc["acceleration"] = state.acceleration;
+  doc["topOverdrivePercent"] = state.topOverdrivePercent;
   doc["coilHoldMs"] = state.coilHoldMs;
   doc["firmwareRepo"] = firmwareRepo;
   doc["firmwareAssetName"] = firmwareAssetName;
@@ -251,13 +263,41 @@ void disableMotorOutputs() {
 }
 
 void setTargetPosition(long logicalTarget) {
+  resetTopReferenceWhenStopped = false;
   targetPosition = clampLogicalPosition(logicalTarget);
   enableMotorOutputs();
   stepper.moveTo(logicalToRaw(targetPosition));
   markDirty();
 }
 
+void setTargetRawWithLogical(long rawTarget, long logicalTarget) {
+  targetPosition = clampLogicalPosition(logicalTarget);
+  enableMotorOutputs();
+  stepper.moveTo(rawTarget);
+  markDirty();
+}
+
+void startOpenMotion() {
+  if (!state.topOverdriveEnabled || state.topOverdrivePercent <= 0.0f) {
+    setTargetPosition(0);
+    return;
+  }
+
+  const float clampedPercent =
+      shutter::math::clampFloat(state.topOverdrivePercent, cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
+  const long extraSteps = static_cast<long>(lroundf((clampedPercent / 100.0f) * static_cast<float>(state.travelSteps)));
+  if (extraSteps <= 0) {
+    setTargetPosition(0);
+    return;
+  }
+
+  resetTopReferenceWhenStopped = true;
+  const long rawTarget = logicalToRaw(-extraSteps);
+  setTargetRawWithLogical(rawTarget, 0);
+}
+
 void stopMotor() {
+  resetTopReferenceWhenStopped = false;
   const long rawNow = stepper.currentPosition();
   stepper.setCurrentPosition(rawNow);
   stepper.moveTo(rawNow);
@@ -267,6 +307,7 @@ void stopMotor() {
 }
 
 void calibrateSetTop() {
+  resetTopReferenceWhenStopped = false;
   stepper.setCurrentPosition(logicalToRaw(0));
   targetPosition = 0;
   stepper.moveTo(logicalToRaw(targetPosition));
@@ -275,6 +316,7 @@ void calibrateSetTop() {
 }
 
 bool calibrateSetBottom() {
+  resetTopReferenceWhenStopped = false;
   long measured = rawToLogical(stepper.currentPosition());
   if (measured < 0) measured = -measured;
   measured = shutter::math::clampLong(measured, cfg::kMinTravelSteps, cfg::kMaxTravelSteps);
@@ -293,6 +335,7 @@ bool calibrateSetBottom() {
 
 void calibrateJog(long logicalDelta) {
   if (logicalDelta == 0) return;
+  resetTopReferenceWhenStopped = false;
   const long rawDelta = logicalDelta * directionSign();
   const long rawTarget = stepper.currentPosition() + rawDelta;
   enableMotorOutputs();
@@ -316,7 +359,7 @@ void handleApiMove() {
   const char* action = body["action"] | "";
 
   if (strcmp(action, "open") == 0) {
-    setTargetPosition(0);
+    startOpenMotion();
   } else if (strcmp(action, "close") == 0) {
     setTargetPosition(state.travelSteps);
   } else if (strcmp(action, "stop") == 0) {
@@ -393,11 +436,18 @@ void handleApiSettings() {
   if (body.containsKey("wifiModemSleep")) {
     state.wifiModemSleep = body["wifiModemSleep"].as<bool>();
   }
+  if (body.containsKey("topOverdriveEnabled")) {
+    state.topOverdriveEnabled = body["topOverdriveEnabled"].as<bool>();
+  }
   if (body.containsKey("maxSpeed")) {
     state.maxSpeed = shutter::math::clampFloat(body["maxSpeed"].as<float>(), cfg::kMinSpeed, cfg::kMaxSpeed);
   }
   if (body.containsKey("acceleration")) {
     state.acceleration = shutter::math::clampFloat(body["acceleration"].as<float>(), cfg::kMinAccel, cfg::kMaxAccel);
+  }
+  if (body.containsKey("topOverdrivePercent")) {
+    state.topOverdrivePercent =
+        shutter::math::clampFloat(body["topOverdrivePercent"].as<float>(), cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
   }
   if (body.containsKey("coilHoldMs")) {
     state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(body["coilHoldMs"].as<long>(), 0, cfg::kMaxCoilHoldMs));
@@ -414,6 +464,7 @@ void handleApiSettings() {
 
   stepper.setCurrentPosition(logicalToRaw(clampedPos));
   stepper.moveTo(logicalToRaw(targetPosition));
+  resetTopReferenceWhenStopped = false;
 
   markDirty();
   if (!saveState(true)) {
@@ -853,6 +904,11 @@ void loop() {
 
   if (wasMoving && !isMoving) {
     motionStoppedAtMs = millis();
+    if (resetTopReferenceWhenStopped) {
+      stepper.setCurrentPosition(logicalToRaw(0));
+      stepper.moveTo(logicalToRaw(0));
+      resetTopReferenceWhenStopped = false;
+    }
     targetPosition = currentLogicalPosition();
     saveState(true);
   }
