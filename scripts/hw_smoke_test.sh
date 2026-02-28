@@ -52,8 +52,18 @@ orig_accel="$(json_get "${initial_state}" 'acceleration')"
 orig_travel="$(json_get "${initial_state}" 'travelSteps')"
 orig_hold="$(json_get "${initial_state}" 'coilHoldMs')"
 orig_reverse="$(json_get "${initial_state}" 'reverseDirection')"
+orig_fw_repo="$(json_get "${initial_state}" 'firmwareRepo')"
+orig_fw_asset="$(json_get "${initial_state}" 'firmwareAssetName')"
+orig_fw_fs_asset="$(json_get "${initial_state}" 'firmwareFsAssetName')"
 
 echo "[INFO] Original settings: maxSpeed=${orig_max_speed}, acceleration=${orig_accel}, travelSteps=${orig_travel}, coilHoldMs=${orig_hold}, reverse=${orig_reverse}"
+echo "[INFO] Original OTA: repo=${orig_fw_repo}, fw=${orig_fw_asset}, fs=${orig_fw_fs_asset}"
+
+echo "[INFO] Verifying OTA default repo fallback when empty"
+ota_default_state="$(api_post '/api/firmware/config' '{"firmwareRepo":"","firmwareAssetName":"","firmwareFsAssetName":""}')"
+assert_eq "dslimp/shutter" "$(json_get "${ota_default_state}" 'firmwareRepo')" "firmwareRepo default fallback"
+assert_eq "firmware.bin" "$(json_get "${ota_default_state}" 'firmwareAssetName')" "firmwareAssetName default fallback"
+assert_eq "littlefs.bin" "$(json_get "${ota_default_state}" 'firmwareFsAssetName')" "firmwareFsAssetName default fallback"
 
 test_payload='{"maxSpeed":1500,"acceleration":420,"travelSteps":12000,"coilHoldMs":650,"reverseDirection":false}'
 echo "[INFO] Applying test settings"
@@ -91,5 +101,9 @@ assert_eq "false" "$(json_get "${state_after_reboot}" 'reverseDirection')" "reve
 echo "[INFO] Restoring original settings"
 restore_payload="{\"maxSpeed\":${orig_max_speed},\"acceleration\":${orig_accel},\"travelSteps\":${orig_travel},\"coilHoldMs\":${orig_hold},\"reverseDirection\":${orig_reverse}}"
 api_post '/api/settings' "${restore_payload}" >/dev/null
+
+echo "[INFO] Restoring original OTA config"
+restore_ota_payload="{\"firmwareRepo\":\"${orig_fw_repo}\",\"firmwareAssetName\":\"${orig_fw_asset}\",\"firmwareFsAssetName\":\"${orig_fw_fs_asset}\"}"
+api_post '/api/firmware/config' "${restore_ota_payload}" >/dev/null
 
 echo "[PASS] Hardware settings persistence test completed"

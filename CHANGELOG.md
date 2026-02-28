@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.1] - 2026-02-28
+
+- Board target fixed to `Wemos ESP-WROOM-02` (`esp_wroom_02`) with GPIO-based pin mapping.
+- LittleFS partition layout fixed for state persistence (`eagle.flash.2m128.ld`).
+- OTA config normalization improved: empty repo/assets fallback to `dslimp/shutter`, strict repo format validation.
+- Added `A0` raw ADC value to `/api/state` and top-panel display in UI.
+- Calibration jog now has a dedicated no-limits path (`POST /api/calibrate` with `{"action":"jog","steps":...}`).
+- Hardware smoke test extended with OTA config fallback checks.
+
 ## [0.1.0] - 2026-02-28
 
 - Initial ESP8266 shutter controller release.

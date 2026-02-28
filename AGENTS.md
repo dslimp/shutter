@@ -9,14 +9,15 @@
 
 ## Project Scope
 
-- Device: `Wemos D1 mini / ESP8266 (ESP-WROOM-02)`
+- Device family: `ESP8266`
+- Main board for this project: `Wemos ESP-WROOM-02`
 - Motor: `28BYJ-48` via `ULN2003`
 - Power: `18650` with proper DC-DC conversion
 - Current phase: bring-up and hardware validation (no deep sleep tuning yet)
 
 ## Firmware Targets
 
-- Primary PlatformIO env: `d1_mini`
+- Primary PlatformIO env: `wroom_02`
 - Test env: `native`
 - Do not switch to ESP32 targets in this repo.
 
