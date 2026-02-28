@@ -1,0 +1,75 @@
+name: Release Artifacts
+
+on:
+  push:
+    branches:
+      - "release/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release-artifacts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="$(cat VERSION)"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build firmware binary
+        run: pio run -e d1_mini
+
+      - name: Build filesystem image
+        run: pio run -e d1_mini -t buildfs
+
+      - name: Run unit tests
+        run: pio test -e native
+
+      - name: Prepare artifact bundle
+        run: |
+          mkdir -p release-bundle
+          cp .pio/build/d1_mini/firmware.bin release-bundle/
+          cp .pio/build/d1_mini/littlefs.bin release-bundle/
+          cp VERSION release-bundle/
+          cp CHANGELOG.md release-bundle/
+          printf "branch=%s\ncommit=%s\n" "${GITHUB_REF_NAME}" "${GITHUB_SHA}" > release-bundle/build-info.txt
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shutter-${{ steps.version.outputs.version }}-${{ steps.version.outputs.short_sha }}
+          path: release-bundle/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body_path: CHANGELOG.md
+          files: |
+            release-bundle/firmware.bin
+            release-bundle/littlefs.bin
+            release-bundle/VERSION
+            release-bundle/CHANGELOG.md
+            release-bundle/build-info.txt
+          fail_on_unmatched_files: false

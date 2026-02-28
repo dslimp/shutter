@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Shutter Controller</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <div class="top">
+      <div>
+        <h1 class="title">Шторы 28BYJ-48</h1>
+        <p class="subtitle">ESP8266 / Wemos / 18650</p>
+      </div>
+      <div class="chips">
+        <span class="chip">Состояние: <b id="chipMotion">-</b></span>
+        <span class="chip">Позиция: <b id="chipPos">-</b></span>
+        <span class="chip">Wi-Fi: <b id="chipWifi">-</b></span>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button id="tabControlBtn" class="tabbtn active" onclick="showTab('control')">Управление</button>
+      <button id="tabCalibBtn" class="tabbtn" onclick="showTab('calib')">Калибровка</button>
+      <button id="tabSettingsBtn" class="tabbtn" onclick="showTab('settings')">Настройки</button>
+    </div>
+
+    <div id="tabControl" class="tab active">
+      <div class="layout">
+        <div class="panel">
+          <h3>Движение</h3>
+
+          <div class="row">
+            <button class="btn" onclick="moveOpen()">Открыть (0%)</button>
+            <button class="btn stop" onclick="moveStop()">Стоп</button>
+            <button class="btn" onclick="moveClose()">Закрыть (100%)</button>
+          </div>
+
+          <div class="row">
+            <div class="field">
+              <label for="targetPercent">Позиция, %</label>
+              <input id="targetPercent" type="number" min="0" max="100" step="1" value="50">
+            </div>
+            <button class="btn" onclick="moveToPercent()">Перейти</button>
+          </div>
+
+          <div class="row">
+            <div class="field">
+              <label for="jogSteps">Шагов для подстройки</label>
+              <input id="jogSteps" type="number" min="1" max="10000" step="1" value="200">
+            </div>
+            <button class="btn ghost" onclick="jogUp()">Поднять</button>
+            <button class="btn ghost" onclick="jogDown()">Опустить</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h3>Метрики</h3>
+          <div class="metrics">
+            <div class="metric"><div class="k">Режим</div><div class="v small" id="motionName">-</div></div>
+            <div class="metric"><div class="k">Калибровка</div><div class="v small" id="calibName">-</div></div>
+            <div class="metric"><div class="k">Текущая позиция</div><div class="v" id="posPercent">0%</div></div>
+            <div class="metric"><div class="k">Целевая позиция</div><div class="v" id="targetPercentView">0%</div></div>
+            <div class="metric"><div class="k">Шаги</div><div class="v small" id="stepsView">0 / 0</div></div>
+            <div class="metric"><div class="k">IP</div><div class="v small" id="ipView">-</div></div>
+          </div>
+        </div>
+      </div>
+
+      <details class="panel">
+        <summary>Raw state JSON</summary>
+        <pre id="rawState">loading...</pre>
+      </details>
+    </div>
+
+    <div id="tabCalib" class="tab">
+      <div class="panel">
+        <h3>Калибровка без концевиков</h3>
+        <p class="help">
+          1) Кнопками "Поднять/Опустить" подведите штору в верхнее положение.<br>
+          2) Нажмите "Установить верх (0%)".<br>
+          3) Подведите штору в нижнее положение.<br>
+          4) Нажмите "Установить низ (100%)".
+        </p>
+
+        <div class="row">
+          <div class="field">
+            <label for="calJogSteps">Шагов для калибровочного джога</label>
+            <input id="calJogSteps" type="number" min="1" max="10000" step="1" value="300">
+          </div>
+          <button class="btn ghost" onclick="calJogUp()">Поднять</button>
+          <button class="btn ghost" onclick="calJogDown()">Опустить</button>
+        </div>
+
+        <div class="row">
+          <button class="btn" onclick="setTop()">Установить верх (0%)</button>
+          <button class="btn" onclick="setBottom()">Установить низ (100%)</button>
+          <button class="btn stop" onclick="resetCalibration()">Сбросить флаг калибровки</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="tabSettings" class="tab">
+      <div class="panel">
+        <h3>Параметры двигателя</h3>
+        <div class="row">
+          <div class="toggle">
+            <input id="reverseDirection" type="checkbox">
+            <label for="reverseDirection">Реверс направления</label>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="travelSteps">Полный ход (шагов)</label>
+            <input id="travelSteps" type="number" min="100" max="300000" step="1">
+          </div>
+          <div class="field">
+            <label for="maxSpeed">Макс. скорость (шаг/с)</label>
+            <input id="maxSpeed" type="number" min="80" max="2500" step="10">
+          </div>
+          <div class="field">
+            <label for="acceleration">Ускорение (шаг/с²)</label>
+            <input id="acceleration" type="number" min="40" max="6000" step="10">
+          </div>
+          <div class="field">
+            <label for="coilHoldMs">Удержание обмоток после стопа (мс)</label>
+            <input id="coilHoldMs" type="number" min="0" max="10000" step="50">
+          </div>
+        </div>
+
+        <div class="row">
+          <button class="btn" onclick="saveSettings()">Сохранить настройки</button>
+          <button class="btn ghost" onclick="resetWifi()">Сброс Wi-Fi и перезапуск</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="status" class="status">Готово</div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
