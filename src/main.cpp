@@ -25,9 +25,10 @@ constexpr uint16_t kDefaultWifiConnectTimeoutMs = 12000;
 constexpr char kDefaultFirmwareRepo[] = "dslimp/shutter";
 constexpr char kDefaultFirmwareAssetName[] = "firmware.bin";
 constexpr char kDefaultFirmwareFsAssetName[] = "littlefs.bin";
-constexpr uint8_t kOtaMaxAttempts = 3;
-constexpr uint16_t kOtaClientTimeoutMs = 12000;
-constexpr uint16_t kOtaRetryDelayMs = 1200;
+constexpr uint8_t kOtaMaxAttempts = 4;
+constexpr uint16_t kOtaClientTimeoutMs = 20000;
+constexpr uint16_t kOtaRetryDelayMs = 2500;
+constexpr uint16_t kOtaQueueStartDelayMs = 400;
 constexpr char kStateFile[] = "/state.json";
 constexpr uint16_t kEepromSize = 512;
 constexpr uint32_t kStateMagic = 0x53485452;  // "SHTR"
@@ -99,6 +100,23 @@ String firmwareRepo = cfg::kDefaultFirmwareRepo;
 String firmwareAssetName = cfg::kDefaultFirmwareAssetName;
 String firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
 bool eepromReady = false;
+
+struct OtaJobState {
+  bool pending = false;
+  bool running = false;
+  bool rebootScheduled = false;
+  bool includeFilesystem = true;
+  String firmwareUrl;
+  String filesystemUrl;
+  String source;
+  String tag;
+  String phase;
+  String lastError;
+  uint32_t queuedAtMs = 0;
+  uint32_t startedAtMs = 0;
+};
+
+OtaJobState otaJob;
 
 #if defined(OTA_FW_PAD_BYTES) && (OTA_FW_PAD_BYTES > 0)
 __attribute__((used)) const uint8_t kOtaFirmwarePad[OTA_FW_PAD_BYTES] PROGMEM = {0xA5};
@@ -239,6 +257,7 @@ void fillStateJson(JsonObject root) {
   const long pos = currentLogicalPosition();
   const long tgt = clampLogicalPosition(targetPosition);
   const bool moving = stepper.distanceToGo() != 0;
+  const uint32_t nowMs = millis();
   uint32_t adcSum = 0;
   for (uint8_t i = 0; i < 8; ++i) {
     adcSum += analogRead(A0);
@@ -281,6 +300,14 @@ void fillStateJson(JsonObject root) {
   root["firmwareRepo"] = firmwareRepo;
   root["firmwareAssetName"] = firmwareAssetName;
   root["firmwareFsAssetName"] = firmwareFsAssetName;
+  root["otaPending"] = otaJob.pending;
+  root["otaRunning"] = otaJob.running;
+  root["otaSource"] = otaJob.source;
+  root["otaTag"] = otaJob.tag;
+  root["otaPhase"] = otaJob.phase;
+  root["otaLastError"] = otaJob.lastError;
+  root["otaQueuedSec"] = otaJob.queuedAtMs > 0 ? (nowMs - otaJob.queuedAtMs) / 1000 : 0;
+  root["otaRunningSec"] = otaJob.startedAtMs > 0 ? (nowMs - otaJob.startedAtMs) / 1000 : 0;
 }
 
 bool loadStateFromLegacyFs() {
@@ -472,7 +499,7 @@ void calibrateJog(long logicalDelta) {
 }
 
 void handleApiState() {
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   fillStateJson(doc.to<JsonObject>());
   sendJsonDocument(200, doc);
 }
@@ -635,6 +662,8 @@ bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessa
   String lastErrText = "unknown";
 
   for (uint8_t attempt = 1; attempt <= cfg::kOtaMaxAttempts; ++attempt) {
+    delay(1);
+    yield();
     if (WiFi.status() != WL_CONNECTED) {
       if (errorMessage) *errorMessage = "wifi disconnected before OTA";
       Serial.printf("[OTA] %s attempt %u/%u skipped: wifi disconnected\n",
@@ -779,6 +808,88 @@ bool runOtaUpdate(const String& firmwareUrl, const String& filesystemUrl, bool i
   return ok;
 }
 
+bool queueOtaJob(
+    const String& firmwareUrl,
+    const String& filesystemUrl,
+    bool includeFilesystem,
+    const String& source,
+    const String& tag,
+    String* errorMessage) {
+  if (errorMessage) errorMessage->clear();
+  if (otaJob.pending || otaJob.running || otaJob.rebootScheduled) {
+    if (errorMessage) *errorMessage = "ota already in progress";
+    return false;
+  }
+  if (firmwareUrl.length() == 0) {
+    if (errorMessage) *errorMessage = "firmware url missing";
+    return false;
+  }
+  if (includeFilesystem && filesystemUrl.length() == 0) {
+    if (errorMessage) *errorMessage = "filesystem url missing";
+    return false;
+  }
+
+  otaJob.pending = true;
+  otaJob.running = false;
+  otaJob.rebootScheduled = false;
+  otaJob.includeFilesystem = includeFilesystem;
+  otaJob.firmwareUrl = firmwareUrl;
+  otaJob.filesystemUrl = filesystemUrl;
+  otaJob.source = source;
+  otaJob.tag = tag;
+  otaJob.phase = "queued";
+  otaJob.lastError = "";
+  otaJob.queuedAtMs = millis();
+  otaJob.startedAtMs = 0;
+  return true;
+}
+
+void processOtaJob() {
+  if (!otaJob.pending || otaJob.running || otaJob.rebootScheduled) return;
+  if (millis() - otaJob.queuedAtMs < cfg::kOtaQueueStartDelayMs) return;
+
+  otaJob.pending = false;
+  otaJob.running = true;
+  otaJob.startedAtMs = millis();
+  otaJob.phase = "starting";
+  otaJob.lastError = "";
+
+  // OTA blocks the main loop for a while; stop motion first to avoid leaving active drive.
+  targetPosition = currentLogicalPosition();
+  stepper.moveTo(logicalToRaw(targetPosition));
+  resetTopReferenceWhenStopped = false;
+  disableMotorOutputs();
+  saveState(true);
+
+  Serial.printf(
+      "[OTA] job start source=%s tag=%s includeFS=%u queuedFor=%lus fw=%s fs=%s\n",
+      otaJob.source.c_str(),
+      otaJob.tag.c_str(),
+      static_cast<unsigned>(otaJob.includeFilesystem),
+      static_cast<unsigned long>((millis() - otaJob.queuedAtMs) / 1000),
+      otaJob.firmwareUrl.c_str(),
+      otaJob.filesystemUrl.c_str());
+
+  otaJob.phase = "updating";
+  String err;
+  const bool ok = runOtaUpdate(otaJob.firmwareUrl, otaJob.filesystemUrl, otaJob.includeFilesystem, &err);
+  otaJob.running = false;
+
+  if (!ok) {
+    otaJob.phase = "failed";
+    otaJob.lastError = err;
+    Serial.printf("[OTA] job failed: %s\n", err.c_str());
+    return;
+  }
+
+  otaJob.rebootScheduled = true;
+  otaJob.phase = "completed";
+  otaJob.lastError = "";
+  Serial.println("[OTA] job complete, rebooting");
+  delay(300);
+  ESP.restart();
+}
+
 void handleApiFirmwareUpdateLatest() {
   StaticJsonDocument<192> body;
   const bool hasBody = parseJsonBody(body);
@@ -792,20 +903,20 @@ void handleApiFirmwareUpdateLatest() {
   const String firmwareUrl = "https://github.com/" + firmwareRepo + "/releases/latest/download/" + firmwareAssetName;
   const String filesystemUrl = "https://github.com/" + firmwareRepo + "/releases/latest/download/" + firmwareFsAssetName;
 
-  String err;
-  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
-    sendError(err.c_str(), 502);
+  String queueErr;
+  if (!queueOtaJob(firmwareUrl, filesystemUrl, includeFilesystem, "latest", "", &queueErr)) {
+    sendError(queueErr.c_str(), 409);
     return;
   }
 
   StaticJsonDocument<384> doc;
   doc["ok"] = true;
-  doc["message"] = "ota update complete, rebooting";
+  doc["message"] = "ota job queued";
+  doc["queued"] = true;
+  doc["source"] = "latest";
   doc["firmwareUrl"] = firmwareUrl;
   doc["filesystemUrl"] = filesystemUrl;
-  sendJsonDocument(200, doc);
-  delay(500);
-  ESP.restart();
+  sendJsonDocument(202, doc);
 }
 
 void handleApiFirmwareUpdateRelease() {
@@ -833,21 +944,21 @@ void handleApiFirmwareUpdateRelease() {
   if (firmwareUrl.length() == 0) firmwareUrl = githubReleaseAssetUrl(tag, firmwareAssetName);
   if (filesystemUrl.length() == 0) filesystemUrl = githubReleaseAssetUrl(tag, firmwareFsAssetName);
 
-  String err;
-  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
-    sendError(err.c_str(), 502);
+  String queueErr;
+  if (!queueOtaJob(firmwareUrl, filesystemUrl, includeFilesystem, "release", tag, &queueErr)) {
+    sendError(queueErr.c_str(), 409);
     return;
   }
 
   StaticJsonDocument<448> doc;
   doc["ok"] = true;
-  doc["message"] = "ota release update complete, rebooting";
+  doc["message"] = "ota release job queued";
+  doc["queued"] = true;
+  doc["source"] = "release";
   doc["tag"] = tag;
   doc["firmwareUrl"] = firmwareUrl;
   doc["filesystemUrl"] = filesystemUrl;
-  sendJsonDocument(200, doc);
-  delay(500);
-  ESP.restart();
+  sendJsonDocument(202, doc);
 }
 
 void handleApiFirmwareCheckLatest() {
@@ -904,18 +1015,18 @@ void handleApiFirmwareUpdateUrl() {
   const String filesystemUrl = String(static_cast<const char*>(body["filesystemUrl"] | ""));
   const bool includeFilesystem = body["includeFilesystem"] | true;
 
-  String err;
-  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
-    sendError(err.c_str(), 502);
+  String queueErr;
+  if (!queueOtaJob(firmwareUrl, filesystemUrl, includeFilesystem, "url", "", &queueErr)) {
+    sendError(queueErr.c_str(), 409);
     return;
   }
 
   StaticJsonDocument<384> doc;
   doc["ok"] = true;
-  doc["message"] = "ota update complete, rebooting";
-  sendJsonDocument(200, doc);
-  delay(500);
-  ESP.restart();
+  doc["message"] = "ota url job queued";
+  doc["queued"] = true;
+  doc["source"] = "url";
+  sendJsonDocument(202, doc);
 }
 
 void handleApiWifiReset() {
@@ -1034,6 +1145,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  processOtaJob();
 
   const long rawBefore = stepper.currentPosition();
   const bool wasMoving = stepper.distanceToGo() != 0;
