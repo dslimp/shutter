@@ -71,3 +71,9 @@
 - Keep implementation focused on shutters, not pump logic.
 - Avoid adding deep sleep logic in this phase unless user asks explicitly.
 - Preserve existing UI style adapted from pump project.
+- OTA reliability is a top-priority support requirement for this project.
+  - Every OTA-related change must be validated on real hardware with both paths:
+    1) GitHub OTA (`latest` and selected release),
+    2) local URL OTA.
+  - For release readiness, run at least 2-3 update cycles per path and verify post-update version/state.
+  - If OTA fails, treat it as a release blocker and do not mark the task complete.

@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.5] - 2026-02-28
+
+- OTA pipeline switched from manual `Update.writeStream` to `ESP8266httpUpdate` for better stability.
+- Added AGENTS guardrail that OTA reliability is a release blocker and requires repeated hardware verification.
+
 ## [0.1.4] - 2026-02-28
 
 - Added configurable top overdrive for `open` command:

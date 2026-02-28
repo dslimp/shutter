@@ -2,6 +2,7 @@
 #include <AccelStepper.h>
 #include <ArduinoJson.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <Updater.h>
@@ -13,7 +14,7 @@
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.4-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.5-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
@@ -491,68 +492,34 @@ bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessa
     if (errorMessage) *errorMessage = "unsupported url scheme";
     return false;
   }
+  ESPhttpUpdate.rebootOnUpdate(false);
+  ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
-  HTTPClient http;
-  http.setTimeout(60000);
-  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  WiFiClient plainClient;
-  std::unique_ptr<BearSSL::WiFiClientSecure> secureClient(new BearSSL::WiFiClientSecure());
-  if (isHttps) secureClient->setInsecure();
-
-  const bool beginOk = isHttps ? http.begin(*secureClient, url) : http.begin(plainClient, url);
-  if (!beginOk) {
-    if (errorMessage) *errorMessage = "http begin failed";
-    return false;
+  t_httpUpdate_return result = HTTP_UPDATE_FAILED;
+  if (isHttps) {
+    BearSSL::WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15000);
+    if (updateFilesystem) {
+      result = ESPhttpUpdate.updateFS(client, url);
+    } else {
+      result = ESPhttpUpdate.update(client, url);
+    }
+  } else {
+    WiFiClient client;
+    client.setTimeout(15000);
+    if (updateFilesystem) {
+      result = ESPhttpUpdate.updateFS(client, url);
+    } else {
+      result = ESPhttpUpdate.update(client, url);
+    }
   }
 
-  const int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    if (errorMessage) *errorMessage = String("http code: ") + String(code);
-    http.end();
-    return false;
+  if (result == HTTP_UPDATE_OK) return true;
+  if (errorMessage) {
+    *errorMessage = String(ESPhttpUpdate.getLastError()) + ": " + ESPhttpUpdate.getLastErrorString();
   }
-
-  const int contentLength = http.getSize();
-  if (contentLength <= 0) {
-    if (errorMessage) *errorMessage = "content length missing";
-    http.end();
-    return false;
-  }
-
-#if defined(U_FS)
-  const int updateCommand = updateFilesystem ? U_FS : U_FLASH;
-#else
-  const int updateCommand = updateFilesystem ? U_SPIFFS : U_FLASH;
-#endif
-
-  if (!Update.begin(static_cast<size_t>(contentLength), updateCommand)) {
-    if (errorMessage) *errorMessage = String(Update.getError());
-    http.end();
-    return false;
-  }
-
-  WiFiClient* stream = http.getStreamPtr();
-  const size_t written = Update.writeStream(*stream);
-  if (written != static_cast<size_t>(contentLength)) {
-    if (errorMessage) *errorMessage = "written bytes mismatch";
-    http.end();
-    return false;
-  }
-
-  if (!Update.end()) {
-    if (errorMessage) *errorMessage = String(Update.getError());
-    http.end();
-    return false;
-  }
-
-  if (!Update.isFinished()) {
-    if (errorMessage) *errorMessage = "update not finished";
-    http.end();
-    return false;
-  }
-
-  http.end();
-  return true;
+  return false;
 }
 
 bool probeGithubTcp(String* errorMessage) {
