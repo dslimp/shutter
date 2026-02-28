@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.8] - 2026-02-28
+
+- Moved persistent controller state to EEPROM (primary), with legacy `/state.json` migration on first boot.
+- Fixed calibration persistence: `set_top`, `set_bottom`, and `reset` now force immediate save.
+- Added hardware regression suite for real device validation:
+  - settings persistence (`reverseDirection`, speeds, hold time),
+  - calibration persistence across reboot and OTA,
+  - OTA repo default fallback and latest URL check.
+- Removed stress-test release padding from firmware/filesystem build configuration.
+
 ## [0.1.6] - 2026-02-28
 
 - OTA stress-test build: increased firmware size (`OTA_FW_PAD_BYTES=65536`) and filesystem image (extra `data/ota_pad.bin`).

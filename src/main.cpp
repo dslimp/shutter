@@ -8,13 +8,14 @@
 #include <Updater.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <LittleFS.h>
+#include <EEPROM.h>
 #include <WiFiManager.h>
 #include <memory>
 
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.6-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.8-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
@@ -25,6 +26,9 @@ constexpr char kDefaultFirmwareRepo[] = "dslimp/shutter";
 constexpr char kDefaultFirmwareAssetName[] = "firmware.bin";
 constexpr char kDefaultFirmwareFsAssetName[] = "littlefs.bin";
 constexpr char kStateFile[] = "/state.json";
+constexpr uint16_t kEepromSize = 512;
+constexpr uint32_t kStateMagic = 0x53485452;  // "SHTR"
+constexpr uint16_t kStateSchemaVersion = 1;
 constexpr uint32_t kSaveIntervalMs = 5000;
 constexpr long kMinTravelSteps = 100;
 constexpr long kMaxTravelSteps = 300000;
@@ -56,6 +60,26 @@ struct ControllerState {
   uint16_t coilHoldMs = 500;
 };
 
+struct PersistedStateBlob {
+  uint32_t magic;
+  uint16_t schemaVersion;
+  uint16_t structSize;
+  int32_t travelSteps;
+  int32_t currentPosition;
+  uint8_t calibrated;
+  uint8_t reverseDirection;
+  uint8_t wifiModemSleep;
+  uint8_t topOverdriveEnabled;
+  float maxSpeed;
+  float acceleration;
+  float topOverdrivePercent;
+  uint16_t coilHoldMs;
+  char firmwareRepo[64];
+  char firmwareAssetName[32];
+  char firmwareFsAssetName[32];
+  uint32_t checksum;
+};
+
 ESP8266WebServer server(80);
 WiFiManager wifiManager;
 AccelStepper stepper(AccelStepper::HALF4WIRE, cfg::kPinIn1, cfg::kPinIn3, cfg::kPinIn2, cfg::kPinIn4);
@@ -71,6 +95,7 @@ bool resetTopReferenceWhenStopped = false;
 String firmwareRepo = cfg::kDefaultFirmwareRepo;
 String firmwareAssetName = cfg::kDefaultFirmwareAssetName;
 String firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
+bool eepromReady = false;
 
 #if defined(OTA_FW_PAD_BYTES) && (OTA_FW_PAD_BYTES > 0)
 __attribute__((used)) const uint8_t kOtaFirmwarePad[OTA_FW_PAD_BYTES] PROGMEM = {0xA5};
@@ -90,6 +115,73 @@ void normalizeFirmwareConfig() {
   if (firmwareRepo.length() == 0) firmwareRepo = cfg::kDefaultFirmwareRepo;
   if (firmwareAssetName.length() == 0) firmwareAssetName = cfg::kDefaultFirmwareAssetName;
   if (firmwareFsAssetName.length() == 0) firmwareFsAssetName = cfg::kDefaultFirmwareFsAssetName;
+}
+
+uint32_t computeChecksum(const uint8_t* data, size_t length) {
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < length; ++i) {
+    hash ^= data[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+void copyStringField(char* dst, size_t dstSize, const String& src) {
+  if (dstSize == 0) return;
+  memset(dst, 0, dstSize);
+  src.substring(0, dstSize - 1).toCharArray(dst, dstSize);
+}
+
+String parseStringField(const char* src, size_t srcSize) {
+  size_t len = 0;
+  while (len < srcSize && src[len] != '\0') ++len;
+  return String(src).substring(0, len);
+}
+
+void fillPersistedBlob(PersistedStateBlob* blob, long pos) {
+  memset(blob, 0, sizeof(PersistedStateBlob));
+  blob->magic = cfg::kStateMagic;
+  blob->schemaVersion = cfg::kStateSchemaVersion;
+  blob->structSize = sizeof(PersistedStateBlob);
+  blob->travelSteps = static_cast<int32_t>(state.travelSteps);
+  blob->currentPosition = static_cast<int32_t>(pos);
+  blob->calibrated = state.calibrated ? 1 : 0;
+  blob->reverseDirection = state.reverseDirection ? 1 : 0;
+  blob->wifiModemSleep = state.wifiModemSleep ? 1 : 0;
+  blob->topOverdriveEnabled = state.topOverdriveEnabled ? 1 : 0;
+  blob->maxSpeed = state.maxSpeed;
+  blob->acceleration = state.acceleration;
+  blob->topOverdrivePercent = state.topOverdrivePercent;
+  blob->coilHoldMs = state.coilHoldMs;
+  copyStringField(blob->firmwareRepo, sizeof(blob->firmwareRepo), firmwareRepo);
+  copyStringField(blob->firmwareAssetName, sizeof(blob->firmwareAssetName), firmwareAssetName);
+  copyStringField(blob->firmwareFsAssetName, sizeof(blob->firmwareFsAssetName), firmwareFsAssetName);
+  blob->checksum = computeChecksum(reinterpret_cast<const uint8_t*>(blob), sizeof(PersistedStateBlob) - sizeof(uint32_t));
+}
+
+bool applyPersistedBlob(const PersistedStateBlob& blob) {
+  if (blob.magic != cfg::kStateMagic) return false;
+  if (blob.schemaVersion != cfg::kStateSchemaVersion) return false;
+  if (blob.structSize != sizeof(PersistedStateBlob)) return false;
+  const uint32_t expected = computeChecksum(reinterpret_cast<const uint8_t*>(&blob), sizeof(PersistedStateBlob) - sizeof(uint32_t));
+  if (blob.checksum != expected) return false;
+
+  state.travelSteps = shutter::math::clampLong(blob.travelSteps, cfg::kMinTravelSteps, cfg::kMaxTravelSteps);
+  state.currentPosition = shutter::math::clampLong(blob.currentPosition, 0, state.travelSteps);
+  state.calibrated = blob.calibrated != 0;
+  state.reverseDirection = blob.reverseDirection != 0;
+  state.wifiModemSleep = blob.wifiModemSleep != 0;
+  state.topOverdriveEnabled = blob.topOverdriveEnabled != 0;
+  state.maxSpeed = shutter::math::clampFloat(blob.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
+  state.acceleration = shutter::math::clampFloat(blob.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
+  state.topOverdrivePercent =
+      shutter::math::clampFloat(blob.topOverdrivePercent, cfg::kMinTopOverdrivePercent, cfg::kMaxTopOverdrivePercent);
+  state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(blob.coilHoldMs, 0, cfg::kMaxCoilHoldMs));
+  firmwareRepo = parseStringField(blob.firmwareRepo, sizeof(blob.firmwareRepo));
+  firmwareAssetName = parseStringField(blob.firmwareAssetName, sizeof(blob.firmwareAssetName));
+  firmwareFsAssetName = parseStringField(blob.firmwareFsAssetName, sizeof(blob.firmwareFsAssetName));
+  normalizeFirmwareConfig();
+  return true;
 }
 
 int directionSign() { return shutter::math::directionSign(state.reverseDirection); }
@@ -188,7 +280,7 @@ void fillStateJson(JsonObject root) {
   root["firmwareFsAssetName"] = firmwareFsAssetName;
 }
 
-bool loadState() {
+bool loadStateFromLegacyFs() {
   if (!LittleFS.exists(cfg::kStateFile)) return false;
 
   File file = LittleFS.open(cfg::kStateFile, "r");
@@ -217,15 +309,22 @@ bool loadState() {
   return true;
 }
 
-bool saveState(bool force = false) {
-  const long pos = currentLogicalPosition();
-  const uint32_t now = millis();
+bool loadStateFromEeprom() {
+  if (!eepromReady) return false;
+  PersistedStateBlob blob;
+  EEPROM.get(0, blob);
+  return applyPersistedBlob(blob);
+}
 
-  if (!force) {
-    if (!settingsDirty && pos == lastSavedPosition) return true;
-    if (now - lastSaveMs < cfg::kSaveIntervalMs) return true;
-  }
+bool saveStateToEeprom(long pos) {
+  if (!eepromReady) return false;
+  PersistedStateBlob blob;
+  fillPersistedBlob(&blob, pos);
+  EEPROM.put(0, blob);
+  return EEPROM.commit();
+}
 
+bool saveStateToLegacyFs(long pos) {
   StaticJsonDocument<1024> doc;
   doc["travelSteps"] = state.travelSteps;
   doc["currentPosition"] = pos;
@@ -247,8 +346,29 @@ bool saveState(bool force = false) {
     file.close();
     return false;
   }
-
   file.close();
+  return true;
+}
+
+bool loadState() {
+  if (loadStateFromEeprom()) return true;
+  if (!loadStateFromLegacyFs()) return false;
+  const long pos = shutter::math::clampLong(state.currentPosition, 0, state.travelSteps);
+  saveStateToEeprom(pos);
+  return true;
+}
+
+bool saveState(bool force = false) {
+  const long pos = currentLogicalPosition();
+  const uint32_t now = millis();
+
+  if (!force) {
+    if (!settingsDirty && pos == lastSavedPosition) return true;
+    if (now - lastSaveMs < cfg::kSaveIntervalMs) return true;
+  }
+
+  if (!saveStateToEeprom(pos)) return false;
+  saveStateToLegacyFs(pos);
   lastSavedPosition = pos;
   lastSaveMs = now;
   settingsDirty = false;
@@ -400,13 +520,16 @@ void handleApiCalibrate() {
   }
 
   const char* action = body["action"] | "";
+  bool shouldPersistNow = false;
   if (strcmp(action, "set_top") == 0) {
     calibrateSetTop();
+    shouldPersistNow = true;
   } else if (strcmp(action, "set_bottom") == 0) {
     if (!calibrateSetBottom()) {
       sendError("failed to set bottom");
       return;
     }
+    shouldPersistNow = true;
   } else if (strcmp(action, "jog") == 0) {
     const long delta = body["steps"] | 0;
     if (delta == 0) {
@@ -417,8 +540,14 @@ void handleApiCalibrate() {
   } else if (strcmp(action, "reset") == 0) {
     state.calibrated = false;
     markDirty();
+    shouldPersistNow = true;
   } else {
     sendError("unknown action");
+    return;
+  }
+
+  if (shouldPersistNow && !saveState(true)) {
+    sendError("failed to persist state", 500);
     return;
   }
 
@@ -501,13 +630,13 @@ bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessa
 
   t_httpUpdate_return result = HTTP_UPDATE_FAILED;
   if (isHttps) {
-    BearSSL::WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(15000);
+    std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
+    client->setInsecure();
+    client->setTimeout(15000);
     if (updateFilesystem) {
-      result = ESPhttpUpdate.updateFS(client, url);
+      result = ESPhttpUpdate.updateFS(*client, url);
     } else {
-      result = ESPhttpUpdate.update(client, url);
+      result = ESPhttpUpdate.update(*client, url);
     }
   } else {
     WiFiClient client;
@@ -600,15 +729,24 @@ bool runOtaUpdate(const String& firmwareUrl, const String& filesystemUrl, bool i
   }
 
   String otaErr;
+  const bool restoreModemSleep = state.wifiModemSleep;
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  ESP.wdtDisable();
+
+  bool ok = true;
   if (includeFilesystem && !performHttpOta(filesystemUrl, true, &otaErr)) {
     if (errorMessage) *errorMessage = String("filesystem update failed: ") + otaErr;
-    return false;
+    ok = false;
   }
-  if (!performHttpOta(firmwareUrl, false, &otaErr)) {
+  if (ok && !performHttpOta(firmwareUrl, false, &otaErr)) {
     if (errorMessage) *errorMessage = String("firmware update failed: ") + otaErr;
-    return false;
+    ok = false;
   }
-  return true;
+
+  ESP.wdtEnable(1000);
+  ESP.wdtFeed();
+  WiFi.setSleepMode(restoreModemSleep ? WIFI_MODEM_SLEEP : WIFI_NONE_SLEEP);
+  return ok;
 }
 
 void handleApiFirmwareUpdateLatest() {
@@ -845,6 +983,9 @@ void setup() {
     LittleFS.format();
     LittleFS.begin();
   }
+
+  EEPROM.begin(cfg::kEepromSize);
+  eepromReady = true;
 
   loadState();
 
