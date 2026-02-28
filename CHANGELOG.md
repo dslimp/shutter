@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.2] - 2026-02-28
+
+- Bumped firmware-reported version to `0.1.2-esp8266` in `/api/state`.
+- Keeps all `0.1.1` changes (WROOM-02 target, A0 in state/UI, no-limits calibration jog).
+
 ## [0.1.1] - 2026-02-28
 
 - Board target fixed to `Wemos ESP-WROOM-02` (`esp_wroom_02`) with GPIO-based pin mapping.
