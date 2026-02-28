@@ -70,6 +70,19 @@ pio run -t uploadfs
 - `POST /api/settings` — изменение параметров
 - `POST /api/wifi/reset` — сброс Wi-Fi и перезагрузка
 - `POST /api/system/reboot` — перезагрузка без сброса Wi-Fi
+- `GET/POST /api/firmware/config` — OTA repo и имена ассетов
+- `POST /api/firmware/update/latest` — обновление до последнего релиза
+- `POST /api/firmware/update/url` — обновление по прямым URL
+
+## OTA (как в peristaltic)
+
+Вкладка `Настройки -> OTA Обновление`:
+1. Укажите `GitHub Repo` и имена ассетов (`firmware.bin`, `littlefs.bin`).
+2. Используйте `Обновить до последнего` (формат URL: `.../releases/latest/download/...`).
+
+Для локального OTA (без GitHub) используйте `Обновить по URL`, указав прямые ссылки на:
+- `firmware.bin`
+- `littlefs.bin`
 
 ## Ограничения
 

@@ -38,6 +38,9 @@
   - `POST /api/calibrate`
   - `POST /api/settings`
   - `POST /api/wifi/reset`
+  - `GET/POST /api/firmware/config`
+  - `POST /api/firmware/update/latest`
+  - `POST /api/firmware/update/url`
 - Do not reintroduce peristaltic pump endpoints (`/api/flow`, `/api/dosing`, etc.) in this repo.
 
 ## Calibration Model

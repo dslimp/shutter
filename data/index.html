@@ -135,6 +135,42 @@
           <button class="btn ghost" onclick="resetWifi()">Сброс Wi-Fi и перезапуск</button>
         </div>
       </div>
+
+      <div class="panel">
+        <h3>OTA Обновление (GitHub Releases)</h3>
+        <div class="row">
+          <div class="field">
+            <label for="fwRepo">GitHub Repo (owner/repo)</label>
+            <input id="fwRepo" type="text" placeholder="dslimp/shutter">
+          </div>
+          <div class="field">
+            <label for="fwAssetName">Firmware asset</label>
+            <input id="fwAssetName" type="text" value="firmware.bin">
+          </div>
+          <div class="field">
+            <label for="fwFsAssetName">Filesystem asset</label>
+            <input id="fwFsAssetName" type="text" value="littlefs.bin">
+          </div>
+          <button class="btn ghost" onclick="saveFirmwareConfig()">Сохранить OTA конфиг</button>
+        </div>
+
+        <div class="row">
+          <button class="btn" onclick="updateFirmwareLatest()">Обновить до последнего</button>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="fwUrl">Firmware URL (.bin)</label>
+            <input id="fwUrl" type="text" placeholder="https://.../firmware.bin">
+          </div>
+          <div class="field">
+            <label for="fwFsUrl">Filesystem URL (.bin)</label>
+            <input id="fwFsUrl" type="text" placeholder="https://.../littlefs.bin">
+          </div>
+          <button class="btn ghost" onclick="updateFirmwareFromUrl()">Обновить по URL</button>
+        </div>
+        <p class="help" id="fwStatusText">OTA idle.</p>
+      </div>
     </div>
 
     <div id="status" class="status">Готово</div>

@@ -60,6 +60,12 @@ function setCheckboxValue(id, value) {
   el.checked = !!value;
 }
 
+function setTextValue(id, value) {
+  const el = document.getElementById(id);
+  if (!el || document.activeElement === el) return;
+  el.value = value;
+}
+
 function renderState(state) {
   latestState = state;
 
@@ -83,6 +89,9 @@ function renderState(state) {
   setInputValue('acceleration', Number(state.acceleration || 0).toFixed(0));
   setInputValue('coilHoldMs', state.coilHoldMs);
   setCheckboxValue('reverseDirection', state.reverseDirection);
+  setTextValue('fwRepo', state.firmwareRepo || '');
+  setTextValue('fwAssetName', state.firmwareAssetName || 'firmware.bin');
+  setTextValue('fwFsAssetName', state.firmwareFsAssetName || 'littlefs.bin');
 }
 
 async function refresh() {
@@ -219,6 +228,60 @@ async function resetWifi() {
     setStatus('Wi-Fi сброшен, устройство перезагружается...');
   } catch (error) {
     setStatus(`Ошибка сброса Wi-Fi: ${error.message}`, true);
+  }
+}
+
+function setFwStatus(text, isError = false) {
+  const fw = document.getElementById('fwStatusText');
+  if (fw) fw.textContent = text;
+  setStatus(text, isError);
+}
+
+async function saveFirmwareConfig() {
+  const payload = {
+    firmwareRepo: document.getElementById('fwRepo').value.trim(),
+    firmwareAssetName: document.getElementById('fwAssetName').value.trim(),
+    firmwareFsAssetName: document.getElementById('fwFsAssetName').value.trim(),
+  };
+
+  try {
+    const response = await req('/api/firmware/config', 'POST', payload);
+    if (latestState) {
+      latestState.firmwareRepo = response.firmwareRepo;
+      latestState.firmwareAssetName = response.firmwareAssetName;
+      latestState.firmwareFsAssetName = response.firmwareFsAssetName;
+    }
+    setFwStatus('OTA конфиг сохранён');
+  } catch (error) {
+    setFwStatus(`Ошибка OTA конфига: ${error.message}`, true);
+  }
+}
+
+async function updateFirmwareLatest() {
+  if (!confirm('Обновить прошивку и LittleFS до последнего релиза?')) return;
+  setFwStatus('Запуск OTA latest...');
+  try {
+    await req('/api/firmware/update/latest', 'POST', { includeFilesystem: true });
+    setFwStatus('OTA запущено, устройство перезагружается...');
+  } catch (error) {
+    setFwStatus(`OTA ошибка: ${error.message}`, true);
+  }
+}
+
+async function updateFirmwareFromUrl() {
+  const firmwareUrl = document.getElementById('fwUrl').value.trim();
+  const filesystemUrl = document.getElementById('fwFsUrl').value.trim();
+  if (!firmwareUrl || !filesystemUrl) {
+    setFwStatus('Укажите оба URL (firmware и littlefs)', true);
+    return;
+  }
+  if (!confirm('Обновить прошивку из указанных URL?')) return;
+  setFwStatus('Запуск OTA по URL...');
+  try {
+    await req('/api/firmware/update/url', 'POST', { firmwareUrl, filesystemUrl, includeFilesystem: true });
+    setFwStatus('OTA запущено, устройство перезагружается...');
+  } catch (error) {
+    setFwStatus(`OTA ошибка: ${error.message}`, true);
   }
 }
 

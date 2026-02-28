@@ -1,10 +1,14 @@
 #include <Arduino.h>
 #include <AccelStepper.h>
 #include <ArduinoJson.h>
+#include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
+#include <Updater.h>
+#include <WiFiClientSecureBearSSL.h>
 #include <LittleFS.h>
 #include <WiFiManager.h>
+#include <memory>
 
 #include "ShutterMath.h"
 
@@ -54,6 +58,9 @@ bool outputsReleased = false;
 long lastSavedPosition = -1;
 uint32_t lastSaveMs = 0;
 uint32_t motionStoppedAtMs = 0;
+String firmwareRepo = "dslimp/shutter";
+String firmwareAssetName = "firmware.bin";
+String firmwareFsAssetName = "littlefs.bin";
 
 int directionSign() { return shutter::math::directionSign(state.reverseDirection); }
 
@@ -132,6 +139,9 @@ void fillStateJson(JsonObject root) {
   root["acceleration"] = state.acceleration;
   root["coilHoldMs"] = state.coilHoldMs;
   root["rawPosition"] = stepper.currentPosition();
+  root["firmwareRepo"] = firmwareRepo;
+  root["firmwareAssetName"] = firmwareAssetName;
+  root["firmwareFsAssetName"] = firmwareFsAssetName;
 }
 
 bool loadState() {
@@ -140,7 +150,7 @@ bool loadState() {
   File file = LittleFS.open(cfg::kStateFile, "r");
   if (!file) return false;
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<1024> doc;
   const DeserializationError err = deserializeJson(doc, file);
   file.close();
   if (err) return false;
@@ -152,6 +162,9 @@ bool loadState() {
   state.maxSpeed = shutter::math::clampFloat(doc["maxSpeed"] | state.maxSpeed, cfg::kMinSpeed, cfg::kMaxSpeed);
   state.acceleration = shutter::math::clampFloat(doc["acceleration"] | state.acceleration, cfg::kMinAccel, cfg::kMaxAccel);
   state.coilHoldMs = static_cast<uint16_t>(shutter::math::clampLong(doc["coilHoldMs"] | state.coilHoldMs, 0, cfg::kMaxCoilHoldMs));
+  firmwareRepo = String(static_cast<const char*>(doc["firmwareRepo"] | firmwareRepo.c_str()));
+  firmwareAssetName = String(static_cast<const char*>(doc["firmwareAssetName"] | firmwareAssetName.c_str()));
+  firmwareFsAssetName = String(static_cast<const char*>(doc["firmwareFsAssetName"] | firmwareFsAssetName.c_str()));
   return true;
 }
 
@@ -164,7 +177,7 @@ bool saveState(bool force = false) {
     if (now - lastSaveMs < cfg::kSaveIntervalMs) return true;
   }
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<1024> doc;
   doc["travelSteps"] = state.travelSteps;
   doc["currentPosition"] = pos;
   doc["calibrated"] = state.calibrated;
@@ -172,6 +185,9 @@ bool saveState(bool force = false) {
   doc["maxSpeed"] = state.maxSpeed;
   doc["acceleration"] = state.acceleration;
   doc["coilHoldMs"] = state.coilHoldMs;
+  doc["firmwareRepo"] = firmwareRepo;
+  doc["firmwareAssetName"] = firmwareAssetName;
+  doc["firmwareFsAssetName"] = firmwareFsAssetName;
 
   File file = LittleFS.open(cfg::kStateFile, "w");
   if (!file) return false;
@@ -349,6 +365,200 @@ void handleApiSettings() {
   handleApiState();
 }
 
+void fillFirmwareConfig(JsonObject root) {
+  root["ok"] = true;
+  root["firmwareRepo"] = firmwareRepo;
+  root["firmwareAssetName"] = firmwareAssetName;
+  root["firmwareFsAssetName"] = firmwareFsAssetName;
+}
+
+bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessage) {
+  if (errorMessage) errorMessage->clear();
+
+  const bool isHttps = url.startsWith("https://");
+  const bool isHttp = url.startsWith("http://");
+  if (!isHttps && !isHttp) {
+    if (errorMessage) *errorMessage = "unsupported url scheme";
+    return false;
+  }
+
+  HTTPClient http;
+  http.setTimeout(60000);
+  WiFiClient plainClient;
+  std::unique_ptr<BearSSL::WiFiClientSecure> secureClient(new BearSSL::WiFiClientSecure());
+  if (isHttps) secureClient->setInsecure();
+
+  const bool beginOk = isHttps ? http.begin(*secureClient, url) : http.begin(plainClient, url);
+  if (!beginOk) {
+    if (errorMessage) *errorMessage = "http begin failed";
+    return false;
+  }
+
+  const int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    if (errorMessage) *errorMessage = String("http code: ") + String(code);
+    http.end();
+    return false;
+  }
+
+  const int contentLength = http.getSize();
+  if (contentLength <= 0) {
+    if (errorMessage) *errorMessage = "content length missing";
+    http.end();
+    return false;
+  }
+
+#if defined(U_FS)
+  const int updateCommand = updateFilesystem ? U_FS : U_FLASH;
+#else
+  const int updateCommand = updateFilesystem ? U_SPIFFS : U_FLASH;
+#endif
+
+  if (!Update.begin(static_cast<size_t>(contentLength), updateCommand)) {
+    if (errorMessage) *errorMessage = String(Update.getError());
+    http.end();
+    return false;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  const size_t written = Update.writeStream(*stream);
+  if (written != static_cast<size_t>(contentLength)) {
+    if (errorMessage) *errorMessage = "written bytes mismatch";
+    http.end();
+    return false;
+  }
+
+  if (!Update.end()) {
+    if (errorMessage) *errorMessage = String(Update.getError());
+    http.end();
+    return false;
+  }
+
+  if (!Update.isFinished()) {
+    if (errorMessage) *errorMessage = "update not finished";
+    http.end();
+    return false;
+  }
+
+  http.end();
+  return true;
+}
+
+
+void handleApiFirmwareConfigGet() {
+  StaticJsonDocument<384> doc;
+  fillFirmwareConfig(doc.to<JsonObject>());
+  sendJsonDocument(200, doc);
+}
+
+void handleApiFirmwareConfigPost() {
+  StaticJsonDocument<512> body;
+  if (!parseJsonBody(body)) {
+    sendError("invalid json");
+    return;
+  }
+
+  if (body.containsKey("firmwareRepo")) {
+    firmwareRepo = String(static_cast<const char*>(body["firmwareRepo"] | ""));
+  }
+  if (body.containsKey("firmwareAssetName")) {
+    firmwareAssetName = String(static_cast<const char*>(body["firmwareAssetName"] | ""));
+  }
+  if (body.containsKey("firmwareFsAssetName")) {
+    firmwareFsAssetName = String(static_cast<const char*>(body["firmwareFsAssetName"] | ""));
+  }
+
+  if (firmwareRepo.length() == 0 || firmwareRepo.indexOf('/') <= 0) {
+    sendError("firmwareRepo must be owner/repo");
+    return;
+  }
+  if (firmwareAssetName.length() == 0 || firmwareFsAssetName.length() == 0) {
+    sendError("asset names must be non-empty");
+    return;
+  }
+
+  markDirty();
+  saveState(true);
+  handleApiFirmwareConfigGet();
+}
+
+
+bool runOtaUpdate(const String& firmwareUrl, const String& filesystemUrl, bool includeFilesystem, String* errorMessage) {
+  if (firmwareUrl.length() == 0) {
+    if (errorMessage) *errorMessage = "firmware url missing";
+    return false;
+  }
+  if (includeFilesystem && filesystemUrl.length() == 0) {
+    if (errorMessage) *errorMessage = "filesystem url missing";
+    return false;
+  }
+
+  String otaErr;
+  if (includeFilesystem && !performHttpOta(filesystemUrl, true, &otaErr)) {
+    if (errorMessage) *errorMessage = String("filesystem update failed: ") + otaErr;
+    return false;
+  }
+  if (!performHttpOta(firmwareUrl, false, &otaErr)) {
+    if (errorMessage) *errorMessage = String("firmware update failed: ") + otaErr;
+    return false;
+  }
+  return true;
+}
+
+void handleApiFirmwareUpdateLatest() {
+  StaticJsonDocument<192> body;
+  const bool hasBody = parseJsonBody(body);
+  const bool includeFilesystem = hasBody ? (body["includeFilesystem"] | true) : true;
+
+  if (firmwareRepo.indexOf('/') <= 0) {
+    sendError("firmwareRepo must be owner/repo");
+    return;
+  }
+  const String firmwareUrl = "https://github.com/" + firmwareRepo + "/releases/latest/download/" + firmwareAssetName;
+  const String filesystemUrl = "https://github.com/" + firmwareRepo + "/releases/latest/download/" + firmwareFsAssetName;
+
+  String err;
+  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
+    sendError(err.c_str(), 502);
+    return;
+  }
+
+  StaticJsonDocument<384> doc;
+  doc["ok"] = true;
+  doc["message"] = "ota update complete, rebooting";
+  doc["firmwareUrl"] = firmwareUrl;
+  doc["filesystemUrl"] = filesystemUrl;
+  sendJsonDocument(200, doc);
+  delay(500);
+  ESP.restart();
+}
+
+
+void handleApiFirmwareUpdateUrl() {
+  StaticJsonDocument<768> body;
+  if (!parseJsonBody(body)) {
+    sendError("invalid json");
+    return;
+  }
+
+  const String firmwareUrl = String(static_cast<const char*>(body["firmwareUrl"] | ""));
+  const String filesystemUrl = String(static_cast<const char*>(body["filesystemUrl"] | ""));
+  const bool includeFilesystem = body["includeFilesystem"] | true;
+
+  String err;
+  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
+    sendError(err.c_str(), 502);
+    return;
+  }
+
+  StaticJsonDocument<384> doc;
+  doc["ok"] = true;
+  doc["message"] = "ota update complete, rebooting";
+  sendJsonDocument(200, doc);
+  delay(500);
+  ESP.restart();
+}
+
 void handleApiWifiReset() {
   wifiManager.resetSettings();
 
@@ -399,6 +609,10 @@ void setupWebServer() {
   server.on("/api/settings", HTTP_POST, handleApiSettings);
   server.on("/api/wifi/reset", HTTP_POST, handleApiWifiReset);
   server.on("/api/system/reboot", HTTP_POST, handleApiReboot);
+  server.on("/api/firmware/config", HTTP_GET, handleApiFirmwareConfigGet);
+  server.on("/api/firmware/config", HTTP_POST, handleApiFirmwareConfigPost);
+  server.on("/api/firmware/update/latest", HTTP_POST, handleApiFirmwareUpdateLatest);
+  server.on("/api/firmware/update/url", HTTP_POST, handleApiFirmwareUpdateUrl);
 
   server.onNotFound(handleNotFound);
   server.begin();
