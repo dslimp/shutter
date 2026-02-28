@@ -13,7 +13,7 @@
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.2-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.3-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
@@ -443,6 +443,7 @@ bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessa
 
   HTTPClient http;
   http.setTimeout(60000);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   WiFiClient plainClient;
   std::unique_ptr<BearSSL::WiFiClientSecure> secureClient(new BearSSL::WiFiClientSecure());
   if (isHttps) secureClient->setInsecure();
@@ -521,6 +522,10 @@ bool probeGithubTcp(String* errorMessage) {
   }
   client.stop();
   return true;
+}
+
+String githubReleaseAssetUrl(const String& tag, const String& assetName) {
+  return "https://github.com/" + firmwareRepo + "/releases/download/" + tag + "/" + assetName;
 }
 
 
@@ -606,6 +611,48 @@ void handleApiFirmwareUpdateLatest() {
   StaticJsonDocument<384> doc;
   doc["ok"] = true;
   doc["message"] = "ota update complete, rebooting";
+  doc["firmwareUrl"] = firmwareUrl;
+  doc["filesystemUrl"] = filesystemUrl;
+  sendJsonDocument(200, doc);
+  delay(500);
+  ESP.restart();
+}
+
+void handleApiFirmwareUpdateRelease() {
+  StaticJsonDocument<768> body;
+  if (!parseJsonBody(body)) {
+    sendError("invalid json");
+    return;
+  }
+
+  normalizeFirmwareConfig();
+  if (!isValidGithubRepo(firmwareRepo)) {
+    sendError("firmwareRepo must be owner/repo");
+    return;
+  }
+
+  const String tag = String(static_cast<const char*>(body["tag"] | ""));
+  if (tag.length() == 0) {
+    sendError("release tag missing");
+    return;
+  }
+  const bool includeFilesystem = body["includeFilesystem"] | true;
+
+  String firmwareUrl = String(static_cast<const char*>(body["firmwareUrl"] | ""));
+  String filesystemUrl = String(static_cast<const char*>(body["filesystemUrl"] | ""));
+  if (firmwareUrl.length() == 0) firmwareUrl = githubReleaseAssetUrl(tag, firmwareAssetName);
+  if (filesystemUrl.length() == 0) filesystemUrl = githubReleaseAssetUrl(tag, firmwareFsAssetName);
+
+  String err;
+  if (!runOtaUpdate(firmwareUrl, filesystemUrl, includeFilesystem, &err)) {
+    sendError(err.c_str(), 502);
+    return;
+  }
+
+  StaticJsonDocument<448> doc;
+  doc["ok"] = true;
+  doc["message"] = "ota release update complete, rebooting";
+  doc["tag"] = tag;
   doc["firmwareUrl"] = firmwareUrl;
   doc["filesystemUrl"] = filesystemUrl;
   sendJsonDocument(200, doc);
@@ -735,6 +782,7 @@ void setupWebServer() {
   server.on("/api/firmware/config", HTTP_POST, handleApiFirmwareConfigPost);
   server.on("/api/firmware/check/latest", HTTP_POST, handleApiFirmwareCheckLatest);
   server.on("/api/firmware/update/latest", HTTP_POST, handleApiFirmwareUpdateLatest);
+  server.on("/api/firmware/update/release", HTTP_POST, handleApiFirmwareUpdateRelease);
   server.on("/api/firmware/update/url", HTTP_POST, handleApiFirmwareUpdateUrl);
 
   server.onNotFound(handleNotFound);

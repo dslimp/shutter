@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.3] - 2026-02-28
+
+- OTA HTTP client now follows redirects, fixing GitHub `latest/download` update path (`302`).
+- Bumped firmware-reported version to `0.1.3-esp8266`.
+
 ## [0.1.2] - 2026-02-28
 
 - Bumped firmware-reported version to `0.1.2-esp8266` in `/api/state`.

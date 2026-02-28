@@ -1,5 +1,6 @@
 let latestState = null;
 let settingsDirty = false;
+let firmwareReleases = [];
 
 const MOTION_NAMES = {
   idle: 'Стоп',
@@ -276,6 +277,92 @@ async function updateFirmwareLatest() {
   try {
     await req('/api/firmware/update/latest', 'POST', { includeFilesystem: true });
     setFwStatus('OTA запущено, устройство перезагружается...');
+  } catch (error) {
+    setFwStatus(`OTA ошибка: ${error.message}`, true);
+  }
+}
+
+function renderFirmwareReleases(items) {
+  firmwareReleases = Array.isArray(items) ? items : [];
+  const select = document.getElementById('fwReleaseSelect');
+  if (!select) return;
+
+  select.innerHTML = '';
+  if (firmwareReleases.length === 0) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'Релизы не найдены';
+    select.appendChild(opt);
+    return;
+  }
+
+  firmwareReleases.forEach((rel, idx) => {
+    const opt = document.createElement('option');
+    opt.value = String(idx);
+    const tag = rel.tag || '-';
+    const name = rel.name && rel.name !== tag ? ` — ${rel.name}` : '';
+    const pre = rel.prerelease ? ' (pre)' : '';
+    opt.textContent = `${tag}${pre}${name}`;
+    select.appendChild(opt);
+  });
+}
+
+async function loadFirmwareReleases() {
+  const repoRaw = document.getElementById('fwRepo').value.trim();
+  const repo = repoRaw || 'dslimp/shutter';
+  if (!/^[^/]+\/[^/]+$/.test(repo)) {
+    setFwStatus('Неверный формат repo, нужно owner/repo', true);
+    return;
+  }
+  const fwAsset = document.getElementById('fwAssetName').value.trim() || 'firmware.bin';
+  const fsAsset = document.getElementById('fwFsAssetName').value.trim() || 'littlefs.bin';
+
+  setFwStatus('Загрузка релизов...');
+  try {
+    const response = await fetch(`https://api.github.com/repos/${repo}/tags?per_page=20`, {
+      headers: { Accept: 'application/vnd.github+json' },
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const tags = await response.json();
+    const releases = (Array.isArray(tags) ? tags : []).map((item) => {
+      const tag = String(item?.name || '');
+      return {
+        tag,
+        name: tag,
+        prerelease: false,
+        draft: false,
+        publishedAt: '',
+        firmwareUrl: `https://github.com/${repo}/releases/download/${tag}/${fwAsset}`,
+        filesystemUrl: `https://github.com/${repo}/releases/download/${tag}/${fsAsset}`,
+      };
+    }).filter((item) => item.tag.length > 0);
+
+    renderFirmwareReleases(releases);
+    setFwStatus(`Релизы загружены: ${releases.length}`);
+  } catch (error) {
+    setFwStatus(`Ошибка загрузки релизов: ${error.message}`, true);
+  }
+}
+
+async function updateFirmwareSelectedRelease() {
+  const select = document.getElementById('fwReleaseSelect');
+  const idx = Number(select?.value ?? -1);
+  const release = Number.isInteger(idx) && idx >= 0 ? firmwareReleases[idx] : null;
+  if (!release || !release.tag) {
+    setFwStatus('Выберите релиз из списка', true);
+    return;
+  }
+  if (!confirm(`Обновить до релиза ${release.tag}?`)) return;
+  setFwStatus(`Запуск OTA релиза ${release.tag}...`);
+  try {
+    await req('/api/firmware/update/release', 'POST', {
+      tag: release.tag,
+      firmwareUrl: release.firmwareUrl || '',
+      filesystemUrl: release.filesystemUrl || '',
+      includeFilesystem: true,
+    });
+    setFwStatus(`OTA ${release.tag} запущено, устройство перезагружается...`);
   } catch (error) {
     setFwStatus(`OTA ошибка: ${error.message}`, true);
   }
