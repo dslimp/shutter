@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.1.9] - 2026-02-28
+
+- OTA reliability hardening for ESP8266:
+  - added firmware/filesystem OTA retries (`3` attempts) with short backoff,
+  - added detailed serial diagnostics per OTA attempt (RSSI, heap, URL, result/error),
+  - removed manual watchdog disable/enable around OTA path to avoid watchdog-reset instability.
+- OTA release selector in UI now uses GitHub Releases API (`/releases`) instead of tags (`/tags`), and skips drafts.
+
 ## [0.1.8] - 2026-02-28
 
 - Moved persistent controller state to EEPROM (primary), with legacy `/state.json` migration on first boot.

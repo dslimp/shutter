@@ -323,24 +323,25 @@ async function loadFirmwareReleases() {
 
   setFwStatus('Загрузка релизов...');
   try {
-    const response = await fetch(`https://api.github.com/repos/${repo}/tags?per_page=20`, {
+    const response = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=20`, {
       headers: { Accept: 'application/vnd.github+json' },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    const tags = await response.json();
-    const releases = (Array.isArray(tags) ? tags : []).map((item) => {
-      const tag = String(item?.name || '');
+    const releasesRaw = await response.json();
+    const releases = (Array.isArray(releasesRaw) ? releasesRaw : []).map((item) => {
+      const tag = String(item?.tag_name || '');
+      const name = String(item?.name || '');
       return {
         tag,
-        name: tag,
-        prerelease: false,
-        draft: false,
-        publishedAt: '',
+        name: name || tag,
+        prerelease: Boolean(item?.prerelease),
+        draft: Boolean(item?.draft),
+        publishedAt: String(item?.published_at || ''),
         firmwareUrl: `https://github.com/${repo}/releases/download/${tag}/${fwAsset}`,
         filesystemUrl: `https://github.com/${repo}/releases/download/${tag}/${fsAsset}`,
       };
-    }).filter((item) => item.tag.length > 0);
+    }).filter((item) => item.tag.length > 0 && !item.draft);
 
     renderFirmwareReleases(releases);
     setFwStatus(`Релизы загружены: ${releases.length}`);

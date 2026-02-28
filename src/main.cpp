@@ -15,7 +15,7 @@
 #include "ShutterMath.h"
 
 namespace cfg {
-constexpr char kFirmwareVersion[] = "0.1.8-esp8266";
+constexpr char kFirmwareVersion[] = "0.1.9-esp8266";
 constexpr char kApSsid[] = "Shutter-Setup";
 constexpr char kApPass[] = "shutter123";
 constexpr uint16_t kApPortalTimeoutSec = 180;
@@ -25,6 +25,9 @@ constexpr uint16_t kDefaultWifiConnectTimeoutMs = 12000;
 constexpr char kDefaultFirmwareRepo[] = "dslimp/shutter";
 constexpr char kDefaultFirmwareAssetName[] = "firmware.bin";
 constexpr char kDefaultFirmwareFsAssetName[] = "littlefs.bin";
+constexpr uint8_t kOtaMaxAttempts = 3;
+constexpr uint16_t kOtaClientTimeoutMs = 12000;
+constexpr uint16_t kOtaRetryDelayMs = 1200;
 constexpr char kStateFile[] = "/state.json";
 constexpr uint16_t kEepromSize = 512;
 constexpr uint32_t kStateMagic = 0x53485452;  // "SHTR"
@@ -627,30 +630,60 @@ bool performHttpOta(const String& url, bool updateFilesystem, String* errorMessa
   }
   ESPhttpUpdate.rebootOnUpdate(false);
   ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  const char* targetName = updateFilesystem ? "filesystem" : "firmware";
+  int lastErr = 0;
+  String lastErrText = "unknown";
 
-  t_httpUpdate_return result = HTTP_UPDATE_FAILED;
-  if (isHttps) {
-    std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
-    client->setInsecure();
-    client->setTimeout(15000);
-    if (updateFilesystem) {
-      result = ESPhttpUpdate.updateFS(*client, url);
-    } else {
-      result = ESPhttpUpdate.update(*client, url);
+  for (uint8_t attempt = 1; attempt <= cfg::kOtaMaxAttempts; ++attempt) {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (errorMessage) *errorMessage = "wifi disconnected before OTA";
+      Serial.printf("[OTA] %s attempt %u/%u skipped: wifi disconnected\n",
+                    targetName, attempt, cfg::kOtaMaxAttempts);
+      return false;
     }
-  } else {
-    WiFiClient client;
-    client.setTimeout(15000);
-    if (updateFilesystem) {
-      result = ESPhttpUpdate.updateFS(client, url);
+
+    Serial.printf("[OTA] %s attempt %u/%u, timeout=%ums, rssi=%d, heap=%u, url=%s\n",
+                  targetName, attempt, cfg::kOtaMaxAttempts, cfg::kOtaClientTimeoutMs,
+                  WiFi.RSSI(), ESP.getFreeHeap(), url.c_str());
+
+    t_httpUpdate_return result = HTTP_UPDATE_FAILED;
+    if (isHttps) {
+      std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure());
+      client->setInsecure();
+      client->setTimeout(cfg::kOtaClientTimeoutMs);
+      if (updateFilesystem) {
+        result = ESPhttpUpdate.updateFS(*client, url);
+      } else {
+        result = ESPhttpUpdate.update(*client, url);
+      }
     } else {
-      result = ESPhttpUpdate.update(client, url);
+      WiFiClient client;
+      client.setTimeout(cfg::kOtaClientTimeoutMs);
+      if (updateFilesystem) {
+        result = ESPhttpUpdate.updateFS(client, url);
+      } else {
+        result = ESPhttpUpdate.update(client, url);
+      }
+    }
+
+    if (result == HTTP_UPDATE_OK) {
+      Serial.printf("[OTA] %s attempt %u/%u result=OK\n", targetName, attempt, cfg::kOtaMaxAttempts);
+      return true;
+    }
+
+    lastErr = ESPhttpUpdate.getLastError();
+    lastErrText = ESPhttpUpdate.getLastErrorString();
+    Serial.printf("[OTA] %s attempt %u/%u failed: code=%d msg=%s\n",
+                  targetName, attempt, cfg::kOtaMaxAttempts, lastErr, lastErrText.c_str());
+
+    if (attempt < cfg::kOtaMaxAttempts) {
+      delay(cfg::kOtaRetryDelayMs);
+      yield();
     }
   }
 
-  if (result == HTTP_UPDATE_OK) return true;
   if (errorMessage) {
-    *errorMessage = String(ESPhttpUpdate.getLastError()) + ": " + ESPhttpUpdate.getLastErrorString();
+    *errorMessage = String(lastErr) + ": " + lastErrText + " (attempts=" + String(cfg::kOtaMaxAttempts) + ")";
   }
   return false;
 }
@@ -731,7 +764,6 @@ bool runOtaUpdate(const String& firmwareUrl, const String& filesystemUrl, bool i
   String otaErr;
   const bool restoreModemSleep = state.wifiModemSleep;
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
-  ESP.wdtDisable();
 
   bool ok = true;
   if (includeFilesystem && !performHttpOta(filesystemUrl, true, &otaErr)) {
@@ -743,8 +775,6 @@ bool runOtaUpdate(const String& firmwareUrl, const String& filesystemUrl, bool i
     ok = false;
   }
 
-  ESP.wdtEnable(1000);
-  ESP.wdtFeed();
   WiFi.setSleepMode(restoreModemSleep ? WIFI_MODEM_SLEEP : WIFI_NONE_SLEEP);
   return ok;
 }
